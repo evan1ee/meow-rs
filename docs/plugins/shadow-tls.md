@@ -126,7 +126,8 @@ rule whose target can carry UDP, so route UDP to another proxy or to
 Shadowsocks UDP straight to `server:port`, outside the TLS disguise. That
 only works if the SS server's UDP port is publicly exposed, and it reveals
 plain SS traffic next to the cover. meow refuses that leak rather than
-emulate it.
+emulate it. This is a Class A (evasion) divergence under
+[ADR-0002](../adr/0002-upstream-divergence-policy.md).
 
 ### Cover handshake
 

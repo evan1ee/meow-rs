@@ -27,6 +27,16 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **shadow-tls v3 against the official server**: sessions through
+  `ihciah/shadow-tls` no longer die before the first payload. The client
+  used to relay its local TLS stack's abort alert to the cover, so the cover
+  hung up and the server shut the session's return path. The alert is now
+  swallowed, and on a TLS 1.2 cover the client ends the handshake as soon
+  as its Finished is sent. An interop suite against the official server
+  (`shadow_tls_v3_e2e`, binary pinned by `scripts/fetch-shadowtls-server.sh`)
+  now runs in CI; see `docs/plugins/shadow-tls.md` for configuration and
+  limits (no UDP on shadow-tls nodes; TLS 1.3 covers recommended).
+
 - **LuCI notifications on OpenWrt 23.05 and 24.10.0**: configuration
   validation/saves, service actions, and client updates no longer report
   failure after succeeding when `ui.addTimeLimitedNotification()` is
