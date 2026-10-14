@@ -1503,7 +1503,7 @@ mod tests {
         let Mode::V3(v3) = &mut shim.mode else {
             unreachable!()
         };
-        *v3 = Box::new(v3_after_server_hello(true));
+        **v3 = v3_after_server_hello(true);
         shim.write_all(&[RECORD_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1])
             .await
             .unwrap();
@@ -1521,7 +1521,7 @@ mod tests {
         let Mode::V3(v3) = &mut shim.mode else {
             unreachable!()
         };
-        *v3 = Box::new(v3_after_server_hello(false));
+        **v3 = v3_after_server_hello(false);
         shim.write_all(&[RECORD_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1])
             .await
             .unwrap();
