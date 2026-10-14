@@ -220,6 +220,15 @@ jobs:
       - name: Build
         run: cargo build --tests
 
+      # shadow_tls_v3_e2e drives the SS / Snell + shadow-tls v3 clients
+      # against the official ihciah/shadow-tls server (the protocol's
+      # reference implementation); its udp-over-tcp legs use the sing-box
+      # installed above as the UoT backend. Every leg is real-peer: without
+      # SHADOWTLS_SERVER_BIN (or sing-box) the suite fails rather than
+      # skipping. shadow_tls_external_interop is opt-in and skips in CI.
+      - name: Fetch official shadow-tls server (pinned, SHA256 verified)
+        run: bash scripts/fetch-shadowtls-server.sh "$RUNNER_TEMP/shadow-tls"
+
       - name: Fetch official TrustTunnel endpoint (pinned, SHA256 verified)
         run: bash scripts/fetch-trusttunnel-endpoint.sh "$RUNNER_TEMP/trusttunnel"
 
@@ -260,6 +269,8 @@ jobs:
           JLS_SERVER_BIN: ${{ runner.temp }}/jls-server
           # And for kcptun_e2e's all-real-peer suite.
           KCPTUN_SERVER_BIN: ${{ runner.temp }}/kcptun-server
+          # And for shadow_tls_v3_e2e's official-server interop suite.
+          SHADOWTLS_SERVER_BIN: ${{ runner.temp }}/shadow-tls/shadow-tls
         run: |
           cargo nextest run --lib --bin meow --bin meow-bench \
             --test common_test \
@@ -282,6 +293,8 @@ jobs:
             --test v2ray_plugin_integration \
             --test gost_plugin_integration \
             --test shadow_tls_test \
+            --test shadow_tls_v3_e2e \
+            --test shadow_tls_external_interop \
             --test restls_e2e \
             --test jls_e2e \
             --test kcptun_e2e \

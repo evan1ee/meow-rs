@@ -17,31 +17,21 @@
 //! upstream: mihomo `adapter/outbound/shadowsocks.go` +
 //! `transport/kcptun` (kcp-go fork), xtaci/kcptun client flags.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use meow_common::atomic::{AtomicU, Uint};
 use meow_common::error::{MeowError, Result};
-use meow_common::ProxyPacketConn;
 use meow_transport::kcptun::{comp_stream, KcpConfig, KcpStream};
 use meow_transport::Stream;
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tracing::{debug, warn};
 
 use crate::dialer::TcpDialer;
 use crate::mux::smux;
 use crate::plugin_util::{parse_bool, parse_bool_strict, sip003_opts};
-use crate::uot::{encode_uot_addr, read_uot_addr};
-
-/// Legacy UDP-over-TCP magic destination (sing-box `uot` v1 / mihomo
-/// `UDPOverTCP`): an SS stream opened here is a datagram pipe — each packet
-/// is `uot-AddrParser addr ‖ u16be len ‖ payload`.
-pub(crate) const UOT_MAGIC_HOST: &str = "sp.udp-over-tcp.arpa";
-pub(crate) const UOT_MAGIC_PORT: u16 = 0;
 
 /// How many dead sessions `open_stream` evicts and redials before giving
 /// up — bounds the retry loop when the UDP path is permanently broken.
@@ -396,108 +386,10 @@ impl KcptunClient {
     }
 }
 
-/// A `ProxyPacketConn` speaking legacy UDP-over-TCP framing over one SS
-/// stream (upstream `uot.NewLazyConn` against `sp.udp-over-tcp.arpa:0`).
-/// Datagram layout per packet, both directions:
-///
-/// ```text
-/// | ATYP | Address | Port  | Length | Payload |
-/// | u8   | var     | u16be | u16be  | var     |   ← uot.AddrParser bytes
-/// ```
-///
-/// Split halves behind mutexes because `ProxyPacketConn` takes `&self`:
-/// a blocked `read_packet` must never hold up `write_packet`.
-pub(crate) struct UotPacketConn {
-    reader: tokio::sync::Mutex<ReadHalf<Box<dyn Stream>>>,
-    writer: tokio::sync::Mutex<WriteHalf<Box<dyn Stream>>>,
-    /// Set once any frame op is torn by cancellation — after a partial
-    /// read or write the stream's framing is unrecoverable, so every
-    /// later packet op must fail fast rather than misdeliver (issue #514).
-    poisoned: std::sync::atomic::AtomicBool,
-}
-
-impl UotPacketConn {
-    pub(crate) fn new(stream: Box<dyn Stream>) -> Self {
-        let (reader, writer) = tokio::io::split(stream);
-        Self {
-            reader: tokio::sync::Mutex::new(reader),
-            writer: tokio::sync::Mutex::new(writer),
-            poisoned: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-}
-
-#[async_trait]
-impl ProxyPacketConn for UotPacketConn {
-    async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        crate::check_not_desynced(&self.poisoned)?;
-        let mut reader = self.reader.lock().await;
-        // Re-check post-lock: a read parked behind a cancelled mid-frame
-        // read must not consume the torn remainder.
-        crate::check_not_desynced(&self.poisoned)?;
-        let mut guard = crate::PoisonOnIncomplete::new(&self.poisoned);
-        let addr = read_uot_addr(&mut *reader).await?;
-        let mut lenb = [0u8; 2];
-        reader.read_exact(&mut lenb).await.map_err(MeowError::Io)?;
-        let len = u16::from_be_bytes(lenb) as usize;
-        if len <= buf.len() {
-            reader
-                .read_exact(&mut buf[..len])
-                .await
-                .map_err(MeowError::Io)?;
-            guard.complete = true;
-            return Ok((len, addr));
-        }
-        // Datagram truncation semantics: read the whole frame (bounded by
-        // the u16 length) so the stream stays aligned, serve what fits,
-        // drop the rest.
-        let mut pkt = vec![0u8; len];
-        reader.read_exact(&mut pkt).await.map_err(MeowError::Io)?;
-        buf.copy_from_slice(&pkt[..buf.len()]);
-        guard.complete = true;
-        Ok((buf.len(), addr))
-    }
-
-    async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
-        crate::check_not_desynced(&self.poisoned)?;
-        if buf.len() > u16::MAX as usize {
-            return Err(MeowError::Proxy(format!(
-                "kcptun uot: datagram too large ({})",
-                buf.len()
-            )));
-        }
-        let mut frame = Vec::with_capacity(buf.len() + 24);
-        encode_uot_addr(&mut frame, addr);
-        frame.extend_from_slice(&(buf.len() as u16).to_be_bytes());
-        frame.extend_from_slice(buf);
-        let mut writer = self.writer.lock().await;
-        crate::check_not_desynced(&self.poisoned)?;
-        let mut guard = crate::PoisonOnIncomplete::new(&self.poisoned);
-        writer.write_all(&frame).await.map_err(MeowError::Io)?;
-        // `write_all` fully buffers the frame through smux's writer
-        // channel; a cancelled flush cannot tear the framing.
-        guard.complete = true;
-        writer.flush().await.map_err(MeowError::Io)?;
-        Ok(buf.len())
-    }
-
-    fn local_addr(&self) -> Result<SocketAddr> {
-        // Tunneled — no meaningful local UDP address exists.
-        Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-    }
-
-    fn close(&self) -> Result<()> {
-        // UoT framing has no close handshake — upstream
-        // `uot.LazyConn.Close` likewise just releases the stream.
-        // Dropping the halves closes the smux stream, which queues a FIN
-        // and releases the session's stream entry.
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
 
     #[test]
     fn defaults_match_upstream() {

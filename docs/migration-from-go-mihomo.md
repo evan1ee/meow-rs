@@ -156,7 +156,12 @@ is called out explicitly.
 
 Fully supported including AEAD-2022 ciphers. The built-in `v2ray-plugin`
 and `gost-plugin` WebSocket transports are included, along with
-`shadow-tls` (all three protocol versions), `restls` (both
+`shadow-tls` (all three protocol versions, also as Snell's
+`obfs-opts.mode: shadow-tls`; v3 is interop-tested against the official
+server; UDP rides `udp-over-tcp` rather than raw SS UDP, and
+`shadow-tls-opts` on trojan/vless/vmess is rejected — see
+[plugins/shadow-tls.md](plugins/shadow-tls.md)), `udp-over-tcp` (v1/v2, over
+any SS transport), `restls` (both
 `version-hint` modes; `force-tls12` maps to the `tls12` path), `jls`
 (hello-random authentication over a real TLS 1.3 handshake) and
 `kcptun` (KCP ARQ with crypt/FEC/snappy over a smux v1 session pool;
@@ -403,10 +408,10 @@ used at dial time. This matches upstream.
 TLS/WS/obfs stack to its own server, then the protocol handshake — over the
 preceding hop's stream (mihomo `DialContextWithDialer` semantics).
 `direct`, `reject`, `http`, `socks5`, `snell`, `vless`, `vmess`, `trojan`,
-`anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel included) all
+`anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel/shadow-tls included) all
 terminate a relay chain. Two carve-outs fail loudly instead of silently
 misbehaving: `hysteria2` (QUIC/UDP cannot ride a TCP stream — first-hop
-only) and `ss` with `gost-plugin`/`shadow-tls`/`restls`/`jls` or an
+only) and `ss` with `gost-plugin`/`restls`/`jls` or an
 external SIP003 plugin (the plugin owns its outbound leg — a record-level
 transport cannot be replayed over an already-proxied stream). Mux pooling
 (`smux`/`yamux`/`h2mux`/`muxcool`) is bypassed on relay hops: a
