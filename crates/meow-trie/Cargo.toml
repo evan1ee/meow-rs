@@ -1,0 +1,26 @@
+[package]
+name = "meow-trie"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Domain trie for efficient pattern matching in the meow-rs proxy kernel."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+
+[[bench]]
+name = "trie_bench"
+harness = false
+
+[[bench]]
+name = "bloomcheck_vs_trie"
+harness = false
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,37 @@
+name: Security Audit
+
+on:
+  schedule:
+    # Weekly, Mondays 03:17 UTC — offset so we're not sharing the top-of-hour load.
+    - cron: "17 3 * * 1"
+  push:
+    paths:
+      - "Cargo.lock"
+      - ".cargo/audit.toml"
+      - ".github/workflows/audit.yml"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - ".cargo/audit.toml"
+      - ".github/workflows/audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  checks: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    # Scheduled workflows also fire on forks that enable Actions — don't
+    # file advisory issues in forks.
+    if: github.event.repository.fork == false
+    steps:
+      - uses: actions/checkout@v5
+
+      # Ignores live in `.cargo/audit.toml` (the workflow's `ignore:` input
+      # in audit-check@v2.0.0 mishandles multiline values).
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

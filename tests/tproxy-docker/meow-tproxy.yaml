@@ -1,0 +1,24 @@
+mixed-port: 7890
+tproxy-port: 7893
+tproxy-sni: true
+routing-mark: 9527
+mode: rule
+log-level: debug
+
+dns:
+  enable: true
+  listen: "127.0.0.1:5353"
+  enhanced-mode: normal
+  nameserver:
+    - "8.8.8.8"
+
+proxies:
+  - name: "test-ss"
+    type: ss
+    server: "10.99.0.1"
+    port: 8388
+    cipher: "aes-128-gcm"
+    password: "test-password"
+
+rules:
+  - "MATCH,DIRECT"

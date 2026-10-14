@@ -1,0 +1,34 @@
+# OpenWrt packaging
+
+Packaging sources for the official OpenWrt `.ipk` and `.apk` release artifacts
+(issues [#284](https://github.com/madeye/meow-rs/issues/284) and
+[#466](https://github.com/madeye/meow-rs/issues/466)).
+
+- `build-ipk.sh` — assembles opkg-format `.ipk` packages from a prebuilt
+  static musl binary, without the OpenWrt SDK. Run with no arguments for
+  usage.
+- `build-apk.sh` — same CLI, produces apk-tools v3 (ADB) `.apk` packages for
+  OpenWrt 25.12+ via `apk mkpkg`, following OpenWrt's `package-pack.mk`
+  (`/lib/apk/packages/<pkg>.{list,conffiles,conffiles_static}`, post-install /
+  post-upgrade / pre-deinstall scripts). Versions are `X.Y.Z-rN`. Packages are
+  unsigned: install with `apk add --allow-untrusted`. Must run as root.
+- `install-apk-tools.sh` — fetches the pinned static apk-tools 3 binary
+  (Alpine `apk-tools-static`, sha256-verified) used by CI and `build-apk.sh`.
+- `meow/files/` — procd init scripts (`meow.init`, `meow-arp.init`),
+  `/etc/config/meow` UCI settings, the default `/etc/meow/config.yaml`,
+  `gateway.sh` (transparent-proxy nftables rules for gateway / side-router
+  mode: kernel TPROXY or REDIRECT, plus the per-client MAC bypass set managed
+  from the LuCI Clients tab), and `arp-hijack.sh` (opt-in, off-by-default
+  ARP-based client steering, an advanced section of the Clients tab — ARP spoofing, for
+  devices you administer only).
+- `luci-app-meow/` — LuCI app: `root/` overlays `/` on the device,
+  `htdocs/` maps to `/www`. Overview, config editor, clients, settings and log
+  views talk to the meow REST API and UCI; the Panel tab embeds the built-in
+  web UI served at `/ui` instead of reimplementing a dashboard.
+- `docker/side-router.sh` — runs OpenWrt in a Docker container on the LAN
+  (macvlan, bridge mode) configured as a side router with meow installed.
+
+Release wiring lives in `.github/workflows/release.yml` (ipk + apk matrix), the
+Docker end-to-end test in `tests/test_openwrt_docker.sh`, the apk build/install
+check in `tests/test_openwrt_apk.sh` (CI job `openwrt-apk`), and user-facing
+documentation in [docs/openwrt.md](../docs/openwrt.md).

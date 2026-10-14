@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>meow-rs</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1923; color: #e0e0e0; min-height: 100vh; }
+header { background: #1a2634; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #2a3a4a; }
+header h1 { font-size: 18px; color: #64b5f6; }
+.header-actions { display: flex; gap: 8px; align-items: center; }
+nav { display: flex; background: #1a2634; border-bottom: 1px solid #2a3a4a; overflow-x: auto; }
+nav button { background: none; border: none; color: #8899aa; padding: 12px 20px; cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
+nav button:hover { color: #e0e0e0; }
+nav button.active { color: #64b5f6; border-bottom-color: #64b5f6; }
+main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+.card { background: #1a2634; border-radius: 8px; padding: 16px; margin-bottom: 16px; border: 1px solid #2a3a4a; }
+.card h3 { margin-bottom: 12px; color: #64b5f6; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+.stat-box { text-align: center; }
+.stat-box .value { font-size: 28px; font-weight: bold; color: #64b5f6; }
+.stat-box .label { font-size: 12px; color: #8899aa; margin-top: 4px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #2a3a4a; font-size: 13px; }
+th { color: #8899aa; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
+tr:hover { background: rgba(100, 181, 246, 0.05); }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+.badge-select { background: #1b5e20; color: #81c784; }
+.badge-url-test { background: #e65100; color: #ffb74d; }
+.badge-fallback { background: #4a148c; color: #ce93d8; }
+.badge-direct { background: #263238; color: #90a4ae; }
+input, select { background: #0f1923; border: 1px solid #2a3a4a; color: #e0e0e0; padding: 8px 12px; border-radius: 4px; font-size: 13px; }
+input:focus, select:focus { outline: none; border-color: #64b5f6; }
+.btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s; }
+.btn-primary { background: #1565c0; color: white; }
+.btn-primary:hover { background: #1976d2; }
+.btn-danger { background: #c62828; color: white; }
+.btn-danger:hover { background: #d32f2f; }
+.btn-success { background: #2e7d32; color: white; }
+.btn-success:hover { background: #388e3c; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+.form-row { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+.form-row input, .form-row select { flex: 1; min-width: 120px; }
+.mode-selector { display: flex; gap: 4px; }
+.mode-selector button { padding: 6px 16px; border: 1px solid #2a3a4a; background: #0f1923; color: #8899aa; border-radius: 4px; cursor: pointer; font-size: 13px; }
+.mode-selector button.active { background: #1565c0; color: white; border-color: #1565c0; }
+.toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 20px; border-radius: 6px; color: white; font-size: 13px; opacity: 0; transition: opacity 0.3s; z-index: 1000; }
+.toast.show { opacity: 1; }
+.toast-success { background: #2e7d32; }
+.toast-error { background: #c62828; }
+.group-card { margin-bottom: 12px; }
+.group-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.group-header strong { font-size: 15px; }
+.proxy-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px; }
+.proxy-item { padding: 8px 12px; border: 1px solid #2a3a4a; border-radius: 6px; cursor: pointer; font-size: 12px; transition: all 0.15s; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proxy-item:hover { border-color: #64b5f6; background: rgba(100,181,246,0.1); }
+.proxy-item.selected { border-color: #64b5f6; background: #1565c0; color: white; }
+.proxy-item.non-select { cursor: default; border-color: #2a3a4a; }
+.rule-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid #2a3a4a; }
+.rule-row .grip { cursor: grab; color: #556677; padding: 0 4px; user-select: none; }
+.rule-row .grip:active { cursor: grabbing; }
+.rule-row .rule-text { flex: 1; font-family: monospace; font-size: 13px; }
+.rule-row .rule-idx { color: #556677; font-size: 11px; min-width: 30px; }
+.hidden { display: none; }
+.empty { text-align: center; padding: 32px; color: #556677; }
+select option { background: #1a2634; }
+.inline-select { background: #0f1923; border: 1px solid #2a3a4a; color: #e0e0e0; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+.search-box { margin-bottom: 12px; }
+.search-box input { width: 100%; }
+.secret-input { width: 160px; background: #0f1923; border: 1px solid #2a3a4a; color: #e0e0e0; padding: 6px 10px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>meow-rs</h1>
+  <div class="header-actions">
+    <input type="password" id="api-secret" placeholder="API Secret"
+           class="secret-input" />
+    <button class="btn btn-success" onclick="saveConfig()">Save Config</button>
+  </div>
+</header>
+
+<nav>
+  <button class="active" onclick="switchTab('overview', this)">Overview</button>
+  <button onclick="switchTab('proxies', this)">Proxies</button>
+  <button onclick="switchTab('subscriptions', this)">Subscriptions</button>
+  <button onclick="switchTab('groups', this)">Proxy Groups</button>
+  <button onclick="switchTab('rules', this)">Rules</button>
+</nav>
+
+<main>
+  <!-- Overview Tab -->
+  <div id="tab-overview">
+    <div class="card">
+      <h3>Mode</h3>
+      <div class="mode-selector" id="mode-selector">
+        <button onclick="setMode('rule')">Rule</button>
+        <button onclick="setMode('global')">Global</button>
+        <button onclick="setMode('direct')">Direct</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Listeners</h3>
+      <div class="stats" id="listeners-info"></div>
+    </div>
+    <div class="card">
+      <h3>Traffic</h3>
+      <div class="stats">
+        <div class="stat-box"><div class="value" id="stat-upload">0 B</div><div class="label">Upload</div></div>
+        <div class="stat-box"><div class="value" id="stat-download">0 B</div><div class="label">Download</div></div>
+        <div class="stat-box"><div class="value" id="stat-connections">0</div><div class="label">Connections</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Proxies Tab (selector switching) -->
+  <div id="tab-proxies" class="hidden">
+    <div id="proxy-groups-selector"></div>
+    <div id="proxy-selector-empty" class="empty">No proxy groups. Add a subscription first.</div>
+  </div>
+
+  <!-- Subscriptions Tab -->
+  <div id="tab-subscriptions" class="hidden">
+    <div class="card">
+      <h3>Add Subscription</h3>
+      <div class="form-row">
+        <input id="sub-name" placeholder="Name" />
+        <input id="sub-url" placeholder="Subscription URL" style="flex: 3" />
+        <input id="sub-interval" placeholder="Interval (sec)" type="number" style="flex: 0.5" />
+        <button class="btn btn-primary" onclick="addSubscription()">Add</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Subscriptions</h3>
+      <table>
+        <thead><tr><th>Name</th><th>URL</th><th>Proxies</th><th>Groups</th><th>Rules</th><th>Last Updated</th><th>Actions</th></tr></thead>
+        <tbody id="sub-list"></tbody>
+      </table>
+      <div id="sub-empty" class="empty">No subscriptions configured</div>
+    </div>
+  </div>
+
+  <!-- Proxy Groups Tab (CRUD) -->
+  <div id="tab-groups" class="hidden">
+    <div class="card">
+      <h3>Create Group</h3>
+      <div class="form-row">
+        <input id="grp-name" placeholder="Group name" />
+        <select id="grp-type">
+          <option value="select">Selector</option>
+          <option value="url-test">URL Test</option>
+          <option value="fallback">Fallback</option>
+        </select>
+        <input id="grp-url" placeholder="Test URL (optional)" />
+        <input id="grp-interval" placeholder="Interval" type="number" style="flex: 0.5" />
+        <input id="grp-tolerance" placeholder="Tolerance" type="number" style="flex: 0.5" />
+        <button class="btn btn-primary" onclick="createGroup()">Create</button>
+      </div>
+      <div class="form-row">
+        <select id="grp-proxies" multiple style="width: 100%; min-height: 60px;"></select>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Proxy Groups</h3>
+      <div id="group-list"></div>
+      <div id="group-empty" class="empty">No proxy groups configured</div>
+    </div>
+  </div>
+
+  <!-- Rules Tab -->
+  <div id="tab-rules" class="hidden">
+    <div class="card">
+      <h3>Add Rule</h3>
+      <div class="form-row">
+        <select id="rule-type">
+          <option value="DOMAIN">DOMAIN</option>
+          <option value="DOMAIN-SUFFIX">DOMAIN-SUFFIX</option>
+          <option value="DOMAIN-KEYWORD">DOMAIN-KEYWORD</option>
+          <option value="IP-CIDR">IP-CIDR</option>
+          <option value="IP-CIDR6">IP-CIDR6</option>
+          <option value="GEOIP">GEOIP</option>
+          <option value="SRC-IP-CIDR">SRC-IP-CIDR</option>
+          <option value="SRC-PORT">SRC-PORT</option>
+          <option value="DST-PORT">DST-PORT</option>
+          <option value="PROCESS-NAME">PROCESS-NAME</option>
+          <option value="MATCH">MATCH</option>
+        </select>
+        <input id="rule-payload" placeholder="Payload (e.g., google.com)" style="flex: 2" />
+        <select id="rule-target"></select>
+        <button class="btn btn-primary" onclick="addRule()">Add</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Rules (<span id="rules-count">0</span>)</h3>
+      <div class="search-box"><input id="rules-search" placeholder="Filter rules..." oninput="filterRules()" /></div>
+      <div id="rules-list"></div>
+      <div id="rules-empty" class="empty">No rules configured</div>
+    </div>
+  </div>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const API = window.location.origin;
+
+function switchTab(name, btn) {
+  document.querySelectorAll('main > div').forEach(d => d.classList.add('hidden'));
+  document.getElementById('tab-' + name).classList.remove('hidden');
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  if (name === 'overview') loadOverview();
+  if (name === 'proxies') loadProxySelector();
+  if (name === 'subscriptions') loadSubscriptions();
+  if (name === 'groups') loadGroups();
+  if (name === 'rules') loadRules();
+}
+
+function toast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast toast-' + type + ' show';
+  setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+function formatBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';
+  return (b / 1073741824).toFixed(2) + ' GB';
+}
+
+function formatTime(ts) {
+  if (!ts) return '-';
+  return new Date(ts * 1000).toLocaleString();
+}
+
+async function api(path, opts) {
+  const secret = localStorage.getItem('meow-secret') || '';
+  const headers = { 'Content-Type': 'application/json' };
+  if (secret) headers['Authorization'] = 'Bearer ' + secret;
+  const res = await fetch(API + path, { headers, ...opts });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || res.statusText);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+function esc(s) { if (!s) return ''; return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+// ── Overview ─────────────────────────────────────────────────────
+
+async function loadOverview() {
+  try {
+    const [cfg, conns] = await Promise.all([api('/configs'), api('/connections')]);
+    document.querySelectorAll('#mode-selector button').forEach(b => {
+      b.classList.toggle('active', b.textContent.toLowerCase() === cfg.mode);
+    });
+    document.getElementById('stat-connections').textContent = conns.connections.length;
+    // Listeners
+    const li = document.getElementById('listeners-info');
+    li.innerHTML = '';
+    const ports = [];
+    if (cfg['mixed-port']) ports.push({label: 'Mixed (HTTP+SOCKS)', value: cfg['mixed-port']});
+    if (cfg['socks-port']) ports.push({label: 'SOCKS', value: cfg['socks-port']});
+    if (cfg['port']) ports.push({label: 'HTTP', value: cfg['port']});
+    if (cfg['external-controller']) ports.push({label: 'API', value: cfg['external-controller']});
+    if (cfg['tun-enabled']) ports.push({label: 'TUN', value: 'enabled'});
+    if (ports.length === 0) ports.push({label: 'Listeners', value: 'none'});
+    for (const p of ports) {
+      li.innerHTML += `<div class="stat-box"><div class="value" style="font-size:20px">${esc(String(p.value))}</div><div class="label">${esc(p.label)}</div></div>`;
+    }
+  } catch (e) { toast('Failed to load overview: ' + e.message, 'error'); }
+}
+
+async function setMode(mode) {
+  try {
+    await api('/configs', { method: 'PATCH', body: JSON.stringify({ mode }) });
+    loadOverview();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+// ── Proxies Tab (selector switching) ─────────────────────────────
+
+async function loadProxySelector() {
+  try {
+    const groups = await api('/api/proxy-groups');
+    const container = document.getElementById('proxy-groups-selector');
+    const empty = document.getElementById('proxy-selector-empty');
+    container.innerHTML = '';
+    empty.classList.toggle('hidden', groups.length > 0);
+
+    for (const g of groups) {
+      const card = document.createElement('div');
+      card.className = 'card group-card';
+      const badgeClass = g.type === 'select' ? 'select' : g.type === 'url-test' ? 'url-test' : 'fallback';
+      const isSelector = g.type === 'select';
+
+      let header = `<div class="group-header"><strong>${esc(g.name)}</strong> <span class="badge badge-${badgeClass}">${esc(g.type)}</span>`;
+      if (isSelector && g.now) header += ` <span style="color:#8899aa;font-size:12px">current: ${esc(g.now)}</span>`;
+      header += '</div>';
+
+      let grid = '<div class="proxy-grid">';
+      for (const p of g.proxies) {
+        const selected = (p === g.now) ? ' selected' : '';
+        if (isSelector) {
+          grid += `<div class="proxy-item${selected}" data-group="${esc(g.name)}" data-proxy="${esc(p)}" title="${esc(p)}">${esc(p)}</div>`;
+        } else {
+          grid += `<div class="proxy-item non-select" title="${esc(p)}">${esc(p)}</div>`;
+        }
+      }
+      grid += '</div>';
+
+      card.innerHTML = header + grid;
+      card.querySelectorAll('.proxy-item[data-proxy]').forEach(item => {
+        item.addEventListener('click', () => selectInGroup(item.dataset.group, item.dataset.proxy, item));
+      });
+      container.appendChild(card);
+    }
+  } catch (e) { toast('Failed to load proxies: ' + e.message, 'error'); }
+}
+
+async function selectInGroup(group, proxy, el) {
+  try {
+    await api(`/api/proxy-groups/${encodeURIComponent(group)}/select`, { method: 'PUT', body: JSON.stringify({ name: proxy }) });
+    // Update UI
+    const card = el.closest('.group-card');
+    card.querySelectorAll('.proxy-item').forEach(i => i.classList.remove('selected'));
+    el.classList.add('selected');
+    const currentSpan = card.querySelector('.group-header span[style]');
+    if (currentSpan) currentSpan.textContent = 'current: ' + proxy;
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+// ── Subscriptions ────────────────────────────────────────────────
+
+async function loadSubscriptions() {
+  try {
+    const subs = await api('/api/subscriptions');
+    const tbody = document.getElementById('sub-list');
+    const empty = document.getElementById('sub-empty');
+    tbody.innerHTML = '';
+    empty.classList.toggle('hidden', subs.length > 0);
+    for (const s of subs) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${esc(s.name)}</td><td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(s.url)}">${esc(s.url)}</td><td>${s.proxy_count}</td><td>${s.group_count}</td><td>${s.rule_count}</td><td>${formatTime(s.last_updated)}</td><td><button class="btn btn-primary btn-sm" data-action="refresh">Refresh</button> <button class="btn btn-danger btn-sm" data-action="delete">Delete</button></td>`;
+      tr.querySelector('[data-action="refresh"]').addEventListener('click', () => refreshSub(s.name));
+      tr.querySelector('[data-action="delete"]').addEventListener('click', () => deleteSub(s.name));
+      tbody.appendChild(tr);
+    }
+  } catch (e) { toast('Failed to load subscriptions: ' + e.message, 'error'); }
+}
+
+async function addSubscription() {
+  const name = document.getElementById('sub-name').value.trim();
+  const url = document.getElementById('sub-url').value.trim();
+  const interval = parseInt(document.getElementById('sub-interval').value) || undefined;
+  if (!name || !url) return toast('Name and URL required', 'error');
+  try {
+    const r = await api('/api/subscriptions', { method: 'POST', body: JSON.stringify({ name, url, interval }) });
+    toast(`Added: ${r.proxy_count} proxies, ${r.group_count} groups, ${r.rule_count} rules`, 'success');
+    document.getElementById('sub-name').value = '';
+    document.getElementById('sub-url').value = '';
+    document.getElementById('sub-interval').value = '';
+    loadSubscriptions();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function refreshSub(name) {
+  try {
+    const r = await api(`/api/subscriptions/${encodeURIComponent(name)}/refresh`, { method: 'POST' });
+    toast(`Refreshed: ${r.proxy_count} proxies, ${r.group_count} groups, ${r.rule_count} rules`, 'success');
+    loadSubscriptions();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function deleteSub(name) {
+  if (!confirm(`Delete subscription "${name}"? This removes the nodes, groups, and rules it contributed.`)) return;
+  try {
+    await api(`/api/subscriptions/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast('Subscription deleted', 'success');
+    loadSubscriptions();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+// ── Proxy Groups (CRUD) ─────────────────────────────────────────
+
+let allProxyNames = [];
+
+async function loadGroups() {
+  try {
+    const [groups, proxies] = await Promise.all([api('/api/proxy-groups'), api('/proxies')]);
+    allProxyNames = Object.keys(proxies.proxies).sort();
+    const sel = document.getElementById('grp-proxies');
+    sel.innerHTML = '';
+    for (const n of allProxyNames) {
+      const opt = document.createElement('option');
+      opt.value = n; opt.textContent = n;
+      sel.appendChild(opt);
+    }
+    const container = document.getElementById('group-list');
+    const empty = document.getElementById('group-empty');
+    container.innerHTML = '';
+    empty.classList.toggle('hidden', groups.length > 0);
+    for (const g of groups) {
+      const div = document.createElement('div');
+      div.className = 'card';
+      const badgeClass = g.type === 'select' ? 'select' : g.type === 'url-test' ? 'url-test' : 'fallback';
+      div.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center"><div><strong>${esc(g.name)}</strong> <span class="badge badge-${badgeClass}">${esc(g.type)}</span> <span style="color:#8899aa;font-size:12px">${g.proxies.length} members</span></div><button class="btn btn-danger btn-sm" data-delete-group="${esc(g.name)}">Delete</button></div>`;
+      div.querySelector('[data-delete-group]').addEventListener('click', () => deleteGroup(g.name));
+      container.appendChild(div);
+    }
+    updateRuleTargets();
+  } catch (e) { toast('Failed to load groups: ' + e.message, 'error'); }
+}
+
+async function createGroup() {
+  const name = document.getElementById('grp-name').value.trim();
+  const type = document.getElementById('grp-type').value;
+  const url = document.getElementById('grp-url').value.trim() || undefined;
+  const interval = parseInt(document.getElementById('grp-interval').value) || undefined;
+  const tolerance = parseInt(document.getElementById('grp-tolerance').value) || undefined;
+  const sel = document.getElementById('grp-proxies');
+  const proxies = Array.from(sel.selectedOptions).map(o => o.value);
+  if (!name) return toast('Name required', 'error');
+  if (proxies.length === 0) return toast('Select at least one proxy', 'error');
+  try {
+    await api('/api/proxy-groups', { method: 'POST', body: JSON.stringify({ name, type, proxies, url, interval, tolerance }) });
+    toast('Group created', 'success');
+    document.getElementById('grp-name').value = '';
+    loadGroups();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function deleteGroup(name) {
+  if (!confirm(`Delete group "${name}"?`)) return;
+  try {
+    await api(`/api/proxy-groups/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast('Group deleted', 'success');
+    loadGroups();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+// ── Rules ────────────────────────────────────────────────────────
+
+let currentRules = [];
+
+function updateRuleTargets() {
+  const sel = document.getElementById('rule-target');
+  sel.innerHTML = '';
+  const targets = ['DIRECT', 'REJECT', 'REJECT-DROP', ...allProxyNames.filter(n => !['DIRECT','REJECT','REJECT-DROP'].includes(n))];
+  for (const t of targets) {
+    const opt = document.createElement('option');
+    opt.value = t; opt.textContent = t;
+    sel.appendChild(opt);
+  }
+}
+
+async function loadRules() {
+  try {
+    const data = await api('/rules');
+    currentRules = data.rules;
+    document.getElementById('rules-count').textContent = currentRules.length;
+    document.getElementById('rules-search').value = '';
+    renderRules();
+    if (allProxyNames.length === 0) {
+      const proxies = await api('/proxies');
+      allProxyNames = Object.keys(proxies.proxies).sort();
+      updateRuleTargets();
+    }
+  } catch (e) { toast('Failed to load rules: ' + e.message, 'error'); }
+}
+
+let dragIdx = null;
+
+function renderRules(filter) {
+  const container = document.getElementById('rules-list');
+  const empty = document.getElementById('rules-empty');
+  container.innerHTML = '';
+  const lf = (filter || '').toLowerCase();
+  let shown = 0;
+  currentRules.forEach((r, i) => {
+    const text = `${r.type},${r.payload}${r.payload ? ',' : ''}${r.proxy}`;
+    if (lf && !text.toLowerCase().includes(lf)) return;
+    shown++;
+    const div = document.createElement('div');
+    div.className = 'rule-row';
+    div.draggable = true;
+    div.dataset.idx = i;
+    div.addEventListener('dragstart', e => { dragIdx = i; e.dataTransfer.effectAllowed = 'move'; div.style.opacity = '0.5'; });
+    div.addEventListener('dragend', () => { div.style.opacity = '1'; });
+    div.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; });
+    div.addEventListener('drop', e => { e.preventDefault(); if (dragIdx !== null && dragIdx !== i) reorderRule(dragIdx, i); dragIdx = null; });
+    div.innerHTML = `<span class="grip">&#x2807;</span><span class="rule-idx">#${i}</span><span class="rule-text">${esc(text)}</span><button class="btn btn-danger btn-sm" onclick="deleteRule(${i})">&#x2715;</button>`;
+    container.appendChild(div);
+  });
+  empty.classList.toggle('hidden', shown > 0);
+}
+
+function filterRules() {
+  renderRules(document.getElementById('rules-search').value);
+}
+
+async function addRule() {
+  const type = document.getElementById('rule-type').value;
+  const payload = document.getElementById('rule-payload').value.trim();
+  const target = document.getElementById('rule-target').value;
+  let ruleStr;
+  if (type === 'MATCH') {
+    ruleStr = `MATCH,${target}`;
+  } else {
+    if (!payload) return toast('Payload required', 'error');
+    ruleStr = `${type},${payload},${target}`;
+  }
+  try {
+    const data = await api('/rules');
+    const rawRules = data.rules.map(r => r.payload ? `${r.type},${r.payload},${r.proxy}` : `${r.type},${r.proxy}`);
+    rawRules.push(ruleStr);
+    await api('/rules', { method: 'POST', body: JSON.stringify({ rules: rawRules }) });
+    toast('Rule added', 'success');
+    document.getElementById('rule-payload').value = '';
+    loadRules();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function deleteRule(idx) {
+  try {
+    await api(`/rules/${idx}`, { method: 'DELETE' });
+    toast('Rule deleted', 'success');
+    loadRules();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function reorderRule(from, to) {
+  try {
+    await api('/rules/reorder', { method: 'POST', body: JSON.stringify({ from, to }) });
+    loadRules();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+// ── Save Config ──────────────────────────────────────────────────
+
+async function saveConfig() {
+  try {
+    await api('/api/config/save', { method: 'POST' });
+    toast('Config saved to disk', 'success');
+  } catch (e) { toast('Save failed: ' + e.message, 'error'); }
+}
+
+// /traffic is a continuous stream, not a finite JSON response. Keep one
+// WebSocket open and update counters as samples arrive.
+let trafficSocket;
+let trafficReconnect;
+function connectTraffic() {
+  clearTimeout(trafficReconnect);
+  if (trafficSocket) {
+    trafficSocket.onclose = null;
+    trafficSocket.close();
+  }
+  const url = new URL('/traffic', API);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  const secret = localStorage.getItem('meow-secret') || '';
+  if (secret) url.searchParams.set('token', secret);
+  const socket = new WebSocket(url);
+  trafficSocket = socket;
+  socket.onmessage = event => {
+    if (socket !== trafficSocket) return;
+    try {
+      const traffic = JSON.parse(event.data);
+      document.getElementById('stat-upload').textContent = formatBytes(traffic.up);
+      document.getElementById('stat-download').textContent = formatBytes(traffic.down);
+    } catch (e) { console.error('Invalid traffic sample', e); }
+  };
+  socket.onclose = () => {
+    trafficReconnect = setTimeout(connectTraffic, 2000);
+  };
+}
+window.addEventListener('pagehide', () => {
+  clearTimeout(trafficReconnect);
+  if (trafficSocket) {
+    trafficSocket.onclose = null;
+    trafficSocket.close();
+  }
+});
+window.addEventListener('pageshow', () => connectTraffic());
+
+// ── Init ─────────────────────────────────────────────────────────
+
+// Accept the API secret from an embedding page (e.g. LuCI) via `#token=`.
+// The fragment is never sent to the server; strip it once stored.
+const hashToken = new URLSearchParams(location.hash.slice(1)).get('token');
+if (hashToken !== null) {
+  localStorage.setItem('meow-secret', hashToken);
+  history.replaceState(null, '', location.pathname + location.search);
+}
+
+// Restore API secret from localStorage
+const secretInput = document.getElementById('api-secret');
+secretInput.value = localStorage.getItem('meow-secret') || '';
+secretInput.addEventListener('change', e => {
+  localStorage.setItem('meow-secret', e.target.value);
+  connectTraffic();
+  loadOverview();
+});
+
+loadOverview();
+setInterval(async () => {
+  if (!document.getElementById('tab-overview').classList.contains('hidden')) {
+    try {
+      const conns = await api('/connections');
+      document.getElementById('stat-connections').textContent = conns.connections.length;
+    } catch (e) {}
+  }
+}, 2000);
+</script>
+</body>
+</html>

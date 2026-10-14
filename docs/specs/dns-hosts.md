@@ -1,0 +1,184 @@
+# Spec: DNS hosts and use-system-hosts (M1.E-5)
+
+Status: Approved (architect 2026-04-11)
+Owner: pm
+Tracks roadmap item: **M1.E-5**
+Supersedes: M0-5 (task #20, completed) — M0-5 wired the trie population from
+`dns.hosts`; M1.E-5 adds wildcard hosts, `use-hosts` toggle, and system hosts.
+Depends on: none.
+Upstream reference: `dns/resolver.go::hostsTable`, `component/hosts/hosts.go`.
+
+## Motivation
+
+M0-5 wired `dns.hosts` YAML entries into the `DomainTrie`. However:
+- `use-hosts` toggle (enable/disable the hosts table without removing entries)
+  is parsed in `RawDns` but the resolver doesn't check it.
+- `use-system-hosts` (read from `/etc/hosts`) is not implemented.
+- Wildcard entries (`*.example.com: 1.2.3.4`) are not supported.
+
+These gaps cause silently-wrong routing: users who set `use-hosts: false`
+intending to disable static entries still get them, and users who configure
+`*.corp.internal: 10.0.0.1` get a parse error or silent no-match.
+
+## Scope
+
+In scope:
+
+1. `use-hosts: bool` (default `true`) — if false, skip the hosts trie lookup
+   entirely during DNS resolution. The trie is still built at startup; the
+   toggle is checked at query time.
+2. Wildcard entries in `dns.hosts`: `"*.example.com": "1.2.3.4"` — matches
+   any single-label subdomain of `example.com`. Uses `DomainTrie` wildcard
+   semantics (same as `+.` in rules: matches root + subdomains).
+3. `use-system-hosts: bool` (default `true`) — read `/etc/hosts` at startup
+   and merge entries into the trie (lower priority than `dns.hosts` config
+   entries).
+4. Multiple IPs per hostname in `dns.hosts`:
+   `"example.com": ["1.2.3.4", "2.3.4.5"]` — returns all IPs as A records.
+5. IPv6 addresses in `dns.hosts` entries — returned as AAAA records.
+
+Out of scope:
+
+- **Hot-reload of `/etc/hosts`** — read once at startup. M3+.
+- **`/etc/hosts` on Windows** (`C:\Windows\System32\drivers\etc\hosts`) —
+  deferred; `use-system-hosts` is a no-op on Windows in M1 with a `warn!`.
+- **Hostnames with trailing dots** — strip at parse time, warn-once.
+- **`0.0.0.0` entries in system hosts** (ad-blocker pattern) — treated as
+  valid; resolve to `0.0.0.0` if queried.
+
+## User-facing config
+
+```yaml
+dns:
+  enable: true
+  use-hosts: true         # default: true; set false to disable hosts table
+  use-system-hosts: true  # default: true; read /etc/hosts at startup
+
+  hosts:
+    "localhost": "127.0.0.1"
+    "*.corp.internal": "10.0.0.50"     # wildcard: any subdomain of corp.internal
+    "dns.corp.internal": "10.0.0.53"   # exact match takes priority over wildcard
+    "dual-stack.example.com":
+      - "1.2.3.4"
+      - "2001:db8::1"                  # both A and AAAA records
+```
+
+**Priority order** (highest first):
+1. Exact match in `dns.hosts` config.
+2. Wildcard match in `dns.hosts` config.
+3. Entry from `/etc/hosts` (system).
+4. Upstream nameservers.
+
+**Hosts vs `nameserver-policy`**: hosts trie lookup runs before `nameserver-policy`
+matching — local data always wins over upstream routing. A domain resolved from
+the hosts table never reaches the nameserver-policy dispatch.
+
+**Divergences from upstream** (classified per
+[ADR-0002](../adr/0002-upstream-divergence-policy.md)):
+
+| # | Case | Class | Rationale |
+|---|------|:-----:|-----------|
+| 1 | `use-system-hosts: true` on Windows — upstream reads from `C:\Windows\...` | B | No-op on Windows in M1, `warn!` at startup. Deferred. |
+| 2 | Malformed IP in `dns.hosts` — upstream silently skips | A | Hard parse error. Malformed IPs in hosts are almost certainly typos. |
+| 3 | Multiple IPs as list — upstream supports | — | We match. YAML list value accepted. |
+
+## Internal design
+
+### Trie population
+
+```rust
+// dns/resolver.rs Resolver::new()
+
+let mut hosts: DomainTrie<Vec<IpAddr>> = DomainTrie::new();
+
+if config.use_hosts {
+    for (domain, ips) in &config.hosts {
+        hosts.insert(domain, ips.clone());
+    }
+    if config.use_system_hosts {
+        for (domain, ips) in parse_system_hosts() {
+            // dns.hosts config takes priority: only insert if not already present
+            if hosts.search(&domain).is_none() {
+                hosts.insert(&domain, ips);
+            }
+        }
+    }
+}
+// else: hosts trie stays empty; use-hosts: false is equivalent to hosts: {}
+```
+
+### System hosts parser
+
+```rust
+fn parse_system_hosts() -> Vec<(String, Vec<IpAddr>)> {
+    let path = if cfg!(unix) { "/etc/hosts" }
+               else { return vec![]; /* Windows no-op M1 */ };
+    let Ok(content) = std::fs::read_to_string(path)
+        else { tracing::warn!("cannot read /etc/hosts"); return vec![]; };
+    // startup-only sync I/O; do not call from query path
+    // Skip comment lines (#); split each line on whitespace:
+    // IP HOSTNAME [aliases...] → one entry per alias including primary hostname
+    // ...
+}
+```
+
+### Wildcard lookup
+
+`DomainTrie` already supports wildcard semantics via `+.` prefix in rules.
+Hosts wildcard `*.example.com` is stored as `+.example.com` internally
+(with `*` → `+.` rewrite at parse time) and resolves via the trie's existing
+wildcard lookup. No new trie logic needed.
+
+## Acceptance criteria
+
+1. `use-hosts: false` → hosts trie lookup skipped; `dns.hosts` entries have
+   no effect on resolution.
+2. `use-hosts: true` (default) → `dns.hosts` entries take priority over
+   upstream nameservers.
+3. `*.corp.internal: 10.0.0.50` → `foo.corp.internal` resolves to
+   `10.0.0.50`; `bar.corp.internal` resolves to `10.0.0.50`; `corp.internal`
+   resolves to `10.0.0.50` (root included per `+.` semantics).
+4. Exact entry `dns.corp.internal: 10.0.0.53` overrides the wildcard
+   `*.corp.internal: 10.0.0.50` for that specific hostname.
+5. `use-system-hosts: true` → `/etc/hosts` entries are included in resolution.
+6. `dns.hosts` entry overrides a conflicting `/etc/hosts` entry for the same domain.
+7. `use-system-hosts: true` on Windows → no-op; `warn!` logged.
+8. Malformed IP in `dns.hosts` → hard parse error. Class A per ADR-0002.
+9. Multiple IPs per hostname with mixed v4/v6 values: an A query returns only
+   the v4 subset; an AAAA query returns only the v6 subset; if the queried address
+   family has no entries in the hosts list, return **NOERROR with zero answers**
+   (not NXDOMAIN — clients may retry on NXDOMAIN but not on empty-answer).
+
+## Test plan (starting point — qa owns final shape)
+
+**Unit (`dns/resolver.rs`):**
+
+- `hosts_exact_match_takes_priority_over_upstream` — `dns.hosts` entry for
+  `example.com`; mock upstream returns different IP; assert hosts IP returned.
+  Upstream: `dns/resolver.go::hostsTable`. NOT upstream IP returned.
+- `hosts_wildcard_matches_subdomain` — `*.corp.internal: 10.0.0.50`;
+  query `foo.corp.internal` → 10.0.0.50. NOT NXDOMAIN.
+- `hosts_wildcard_matches_root` — `*.corp.internal`; query `corp.internal`
+  → 10.0.0.50 (root included). NOT NXDOMAIN.
+- `hosts_exact_overrides_wildcard` — both `*.corp.internal` and
+  `dns.corp.internal`; query `dns.corp.internal` → exact match value.
+  NOT wildcard value.
+- `use_hosts_false_bypasses_table` — `use-hosts: false`; configured entry
+  for `example.com`; assert upstream queried (not hosts value returned).
+  NOT hosts entry returned when disabled.
+- `system_hosts_loaded_when_enabled` — mock `/etc/hosts` with known entry;
+  assert it resolves. NOT ignored.
+- `system_hosts_overridden_by_config_hosts` — same domain in both; config
+  hosts wins. NOT system hosts wins.
+- `hosts_malformed_ip_hard_errors` — `"example.com": "not-an-ip"` →
+  parse error at startup. Class A per ADR-0002.
+
+## Implementation checklist (engineer handoff)
+
+- [ ] Verify `use-hosts` is checked at query time in `Resolver::resolve_ip()`
+      (not just at trie-build time).
+- [ ] Rewrite `*.foo` patterns as `+.foo` at `dns.hosts` parse time.
+- [ ] Parse multi-value hosts (`[ip1, ip2]`) in `dns_parser.rs`.
+- [ ] Implement `parse_system_hosts()` for Unix; no-op + warn for Windows.
+- [ ] Wire system hosts population in `Resolver::new()` respecting priority.
+- [ ] Update `docs/roadmap.md` M1.E-5 row with merged PR link.

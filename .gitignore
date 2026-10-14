@@ -1,0 +1,34 @@
+/target
+config.yaml
+config.yaml.bak
+config.yaml.tmp
+config.yaml.*.tmp
+config-*.yaml
+# benchmark configs are tracked sources, not local runtime config
+!config-bench.yaml
+!config-bench-*.yaml
+config-*.yaml.bak
+config-*.yaml.tmp
+config-*.yaml.*.tmp
+# default config shipped inside the OpenWrt ipk is tracked source, not a
+# local runtime config
+!openwrt/meow/files/config.yaml
+Country.mmdb
+Dockerfile.debug
+dhat-heap.json
+dhat-ad-hoc.json
+dh_out.json
+*.swp
+*.swo
+*.swn
+*.un~
+.claude/scheduled_tasks.lock
+.antigravitycli/
+
+# VitePress docs build output (generated into docs/ by CI; see website/).
+# Build-only: published via the Deploy GitHub Pages workflow's artifact, so
+# the repo's Pages source must be "GitHub Actions" (see .github/workflows/pages.yml).
+/docs/guide/
+website/node_modules
+website/.vitepress/cache
+website/.vitepress/dist

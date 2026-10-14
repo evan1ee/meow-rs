@@ -1,0 +1,180 @@
+# meow-rs sample configuration
+
+# Inbound listeners
+mixed-port: 7890
+# port: 7891        # HTTP proxy port (optional, mixed-port covers both)
+# socks-port: 7892  # SOCKS5 port (optional, mixed-port covers both)
+
+# Transparent proxy
+# Linux / macOS: tproxy-port + firewall (nftables / pf). Requires root.
+# tproxy-port: 7893      # Enable transparent proxy on this port
+# tproxy-sni: true       # Extract SNI from TLS ClientHello (default: true)
+# routing-mark: 9527     # SO_MARK for DIRECT loop avoidance on Linux
+#
+# A named `listeners:` tproxy entry also accepts `firewall: false` to leave
+# all rule management to an external system (no nft/pfctl calls from meow).
+# The tproxy-port shorthand always stays managed — a top-level `firewall:`
+# key does not exist and is ignored (with a warning). Linux only: `udp: true`
+# enables UDP TPROXY on the same port (requires `firewall: false`, an IPv4
+# listen, and deployer-owned fwmark/policy routing). See docs/tproxy-gateway.md.
+#
+# Windows: Wintun TUN inbound (the transparent-proxy path). Requires an
+# elevated process. Official zips ship wintun.dll next to meow.exe; if it
+# is missing the official DLL embedded in the binary is extracted. Also
+# needs dns.enhanced-mode: fake-ip. See docs/tun.md.
+# tun:
+#   enable: true
+#   auto-route: true
+#   dns-hijack:
+#     - any:53
+
+allow-lan: false
+bind-address: "127.0.0.1"
+mode: rule
+log-level: info
+ipv6: false
+# Fail startup (and reject `PUT /configs`) on unparseable entries instead of
+# warn-and-skip: malformed proxies/groups/rules, bad provider definitions or
+# payloads, and dangling `use:`/`RULE-SET` references all become hard errors.
+# Transient provider fetch failures stay lenient — the provider registers
+# empty and refreshes heal it later. `?force=true` overrides strict.
+# strict: true
+
+# REST API
+external-controller: 127.0.0.1:9090
+secret: ""
+# Mount a third-party dashboard (metacubexd, yacd, …) at /ui instead of the
+# built-in panel. Point external-ui at a directory of static files; if the UI
+# lives in a sub-directory, set external-ui-name. Auto-download via
+# external-ui-url is not performed — populate the directory yourself.
+# external-ui: ./ui
+# external-ui-name: dist
+# external-ui-url: https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip
+
+# DNS
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  nameserver:
+    - 8.8.8.8
+    - 1.1.1.1
+  fallback:
+    - 8.8.4.4
+    - 1.0.0.1
+
+# Proxies
+proxies:
+  - name: "ss-example"
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: "your-password"
+    udp: true
+
+  # Built-in simple-obfs plugin (no external `obfs-local` / `simple-obfs`
+  # binary required). Set `plugin: obfs` and pick `mode: http` or `mode: tls`.
+  # - name: "ss-obfs-example"
+  #   type: ss
+  #   server: 1.2.3.4
+  #   port: 8388
+  #   cipher: aes-256-gcm
+  #   password: "your-password"
+  #   udp: true
+  #   plugin: obfs
+  #   plugin-opts:
+  #     mode: http
+  #     host: bing.com
+
+  - name: "trojan-example"
+    type: trojan
+    server: 5.6.7.8
+    port: 443
+    password: "your-password"
+    sni: example.com
+    skip-cert-verify: false
+    udp: true
+    # dialer-proxy: reach this server *through* another proxy/group (chained
+    # dialing, mihomo-compatible). The referenced name may be any proxy or
+    # group; cycles are rejected at load time. UDP rides the chain too when
+    # the front can carry it (datagram protocols fail closed otherwise).
+    # dialer-proxy: "Proxy"
+
+# Proxy groups
+# Group names must be unique (no collision with a built-in, a proxies:
+# entry, or another group) and the group-membership graph must be
+# acyclic — both are hard config errors, checked before construction.
+proxy-groups:
+  - name: "Proxy"
+    type: select
+    proxies:
+      - ss-example
+      - trojan-example
+      - DIRECT
+
+  - name: "Auto"
+    type: url-test
+    proxies:
+      - ss-example
+      - trojan-example
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+
+  - name: "Fallback"
+    type: fallback
+    proxies:
+      - ss-example
+      - trojan-example
+
+# Rules
+rules:
+  # Direct
+  - DOMAIN-SUFFIX,local,DIRECT
+  - DOMAIN-KEYWORD,localhost,DIRECT
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+
+  # Common proxy rules
+  - DOMAIN-SUFFIX,google.com,Proxy
+  - DOMAIN-SUFFIX,youtube.com,Proxy
+  - DOMAIN-SUFFIX,github.com,Proxy
+  - DOMAIN-KEYWORD,twitter,Proxy
+  - DOMAIN-KEYWORD,facebook,Proxy
+
+  # Ports
+  - DST-PORT,22,DIRECT
+  - SRC-PORT,7777,DIRECT
+
+  # Network
+  - NETWORK,udp,DIRECT
+
+  # Process
+  - PROCESS-NAME,curl,DIRECT
+
+  # Final fallback
+  - MATCH,Proxy
+
+# Subscriptions (remote Clash configs merged in as a tracked contribution).
+# A refresh merges the fetched document's proxies/proxy-groups by name
+# (remote entries shadow same-named local ones) and prepends its rules —
+# local entries and other subscriptions' content survive, and entries the
+# remote stopped shipping are removed on the next apply (tracked via the
+# written-back applied-proxies/applied-groups/applied-rules fields). The
+# result is written back to this file (re-serialised — comments are lost;
+# a .bak of the previous file is kept once). `interval` is in seconds;
+# omit it to fetch once. A transport failure (unreachable/non-2xx) retries
+# every 60 s, but an unparseable or shape-defective document stamps
+# last-updated and is retried only after `interval` — never, for an
+# interval-less entry. `-t` validates the file as written and does not
+# fetch subscriptions. `proxy:` (optional) routes the fetch through a
+# top-level proxy or group name — absent/empty/DIRECT fetches direct, and
+# an unknown name fails the fetch rather than leaking a direct request.
+# See website/guide/configuration.md.
+# subscriptions:
+#   - name: airport
+#     url: https://example.com/clash.yaml
+#     interval: 86400
+#     proxy: PROXY

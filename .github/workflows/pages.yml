@@ -1,0 +1,62 @@
+name: Deploy GitHub Pages
+
+# IMPORTANT: the repository's Pages source must be set to "GitHub Actions"
+# (Settings -> Pages -> Build and deployment -> Source: GitHub Actions).
+# The documentation SPA lives in docs/guide/, which is build-only and
+# gitignored -- it exists solely in this workflow's uploaded artifact and is
+# never committed. If Pages is instead set to "Deploy from a branch" (e.g.
+# main /docs), the committed landing page (docs/index.html) still serves at
+# the site root, but /meow-rs/guide/ 404s because docs/guide/ is absent from
+# the branch. Keep the source on "GitHub Actions" so the built guide ships.
+
+on:
+  push:
+    branches: [main]
+    paths: [docs/**, website/**, README.md]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    if: github.event.repository.fork == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: website/package.json
+
+      # Build the VitePress documentation SPA into docs/guide/ so it ships
+      # alongside the hand-built landing page (docs/index.html).
+      - name: Build docs site
+        working-directory: website
+        run: |
+          npm install --no-audit --no-fund
+          npm run docs:build
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

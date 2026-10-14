@@ -1,0 +1,611 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
+  pull_request:
+    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
+
+# One active run per ref: a superseded push to the same PR/branch cancels the
+# in-flight run instead of racing it to completion. `push` is limited to
+# `main` above, so a PR branch is tested exactly once per push (via the
+# pull_request event) instead of twice.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# No step needs write: dashboard's artifact upload works under read.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  luci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: openwrt/luci-app-meow/package-lock.json
+      - name: Check vendored YAML bundle is reproducible
+        run: |
+          npm --prefix openwrt/luci-app-meow ci
+          npm --prefix openwrt/luci-app-meow run build
+          git diff --exit-code -- openwrt/luci-app-meow/htdocs/luci-static/resources/tools/meow_yaml.js openwrt/luci-app-meow/htdocs/luci-static/resources/tools/meow_yaml.LICENSE
+      - name: LuCI syntax, ACL and save regression tests
+        run: bash tests/test_luci_meow.sh
+
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/dashboard
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: tests/dashboard/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Dashboard unit and browser tests
+        run: npm test
+      - name: Upload browser failure traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-test-results
+          path: tests/dashboard/test-results/
+          retention-days: 7
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # This gate runs on the rust-toolchain.toml pin via rustup's
+      # toolchain-file resolution (the file beats `rustup default`; the
+      # @stable step just provides rustup + a fallback toolchain — no
+      # `components:`, the pin declares its own). Mirrored on floating
+      # stable by toolchain-drift.yml — keep the step set in sync.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Also stands in for the per-crate `cargo check --all-features` legs
+      # that used to run in the test job (transport G7, VLESS G3): clippy is
+      # a strict superset of check.
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Doc check
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # cargo-nextest: per-test process isolation + `--retries 2 --no-fail-fast` absorbs
+      # the tail-latency/UDP-drop flakes these real-I/O suites are prone to
+      # on shared runners (e.g. snell_v3_docker_udp read timeouts).
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache ssserver binary
+        id: cache-ssserver
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/ssserver
+          key: ssserver-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install ssserver
+        if: steps.cache-ssserver.outputs.cache-hit != 'true'
+        # --force: on a Cargo.lock change this step's cache misses, but the
+        # rust-cache restore may already have an ssserver in ~/.cargo/bin,
+        # and a plain `cargo install` refuses to overwrite it.
+        run: cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --locked --force
+
+      - name: Install simple-obfs (obfs-local / obfs-server)
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends simple-obfs
+          # Fail fast if either binary is missing — the obfs integration tests
+          # rely on both being on PATH (otherwise they would silently SKIP).
+          command -v obfs-local
+          command -v obfs-server
+
+      # Real-server smux E2E (smux_singbox_integration) runs against this
+      # pinned sing-box and REFUSES to silently skip when it is missing,
+      # so a green run always means real-server smux was exercised. Keep
+      # the version in sync with SINGBOX_VERSION in
+      # crates/meow-app/tests/smux_singbox_integration.rs.
+      - name: Install sing-box (real-server smux E2E)
+        run: |
+          set -euo pipefail
+          SINGBOX_VERSION=1.14.0
+          curl -fsSL -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          command -v sing-box
+
+      # Real-peer gost-plugin interop (gost_plugin_integration) runs against
+      # this pinned gost binary — with it on PATH the suite exercises a real
+      # `ss+mws` server instead of printing SKIP.
+      - name: Install gost (gost-plugin interop E2E)
+        run: |
+          set -euo pipefail
+          GOST_VERSION=3.3.0
+          curl -fsSL -o /tmp/gost.tar.gz \
+            "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/gost.tar.gz -C /tmp gost
+          sudo install -m 755 /tmp/gost /usr/local/bin/gost
+          command -v gost
+
+      # The restls upstream-interop leg runs against a real
+      # metacubex/restls-client-go server built from the committed Go
+      # harness; RESTLS_SERVER_BIN on the test step tells the suite where
+      # it lives (the test fails when the env is unset — no silent skip).
+      - name: Set up Go (restls interop harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/meow-transport/tests/support/restls-server/go.mod
+          cache: false
+
+      - name: Build restls-server harness
+        run: go build -C crates/meow-transport/tests/support/restls-server -o "$RUNNER_TEMP/restls-server" .
+
+      # The jls upstream-interop leg runs against a real metacubex/jls-tls
+      # server built from the committed Go harness; JLS_SERVER_BIN on the
+      # test step tells the suite where it lives (the test fails when the
+      # env is unset — no silent skip).
+      - name: Set up Go (jls interop harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/meow-transport/tests/support/jls-server/go.mod
+          cache: false
+
+      - name: Build jls-server harness
+        run: go build -C crates/meow-transport/tests/support/jls-server -o "$RUNNER_TEMP/jls-server" .
+
+      # The kcptun e2e suite drives the full SS→smux→snappy→KCP→crypt/FEC
+      # stack against a real upstream Go peer (kcp-go + xtaci/smux +
+      # go-shadowsocks2), so build the in-tree harness. Without
+      # KCPTUN_SERVER_BIN every leg loud-skips — a green run here always
+      # means real wire interop was exercised.
+      - name: Set up Go (kcptun harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/meow-proxy/tests/support/kcptun-server/go.mod
+
+      - name: Build kcptun interop harness
+        working-directory: crates/meow-proxy/tests/support/kcptun-server
+        run: go build -o "$RUNNER_TEMP/kcptun-server" .
+
+      - name: Build
+        run: cargo build --tests
+
+      - name: Fetch official TrustTunnel endpoint (pinned, SHA256 verified)
+        run: bash scripts/fetch-trusttunnel-endpoint.sh "$RUNNER_TEMP/trusttunnel"
+
+      - name: TrustTunnel opt-in protocol and configuration tests
+        env:
+          TRUSTTUNNEL_SERVER_BIN: ${{ runner.temp }}/trusttunnel/trusttunnel_endpoint
+        run: |
+          cargo nextest run -p meow-proxy --no-default-features --features trusttunnel --lib trusttunnel --retries 2 --no-fail-fast
+          cargo nextest run -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_integration --retries 2 --no-fail-fast
+          cargo nextest run -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_e2e --retries 2 --no-fail-fast
+          cargo nextest run -p meow-config --features trusttunnel --test trusttunnel_config_test --retries 2 --no-fail-fast
+          cargo nextest run -p meow-config --no-default-features --test trusttunnel_config_test --retries 2 --no-fail-fast
+          cargo nextest run -p meow-api --features meow-config/trusttunnel --test api_test trusttunnel_provider --retries 2 --no-fail-fast
+          # The HTTP/3 transport is a second opt-in feature on top of it, so
+          # the quiche driver, its in-tree HTTP/3 peer tests, the official
+          # endpoint's `[listen_protocols.quic]` interop leg and the `quic:`
+          # parser contract are invisible to every run above.
+          cargo nextest run -p meow-proxy --no-default-features --features trusttunnel-h3 --lib trusttunnel --retries 2 --no-fail-fast
+          cargo nextest run -p meow-proxy --no-default-features --features trusttunnel-h3 --test trusttunnel_e2e --retries 2 --no-fail-fast
+          cargo nextest run -p meow-config --features trusttunnel-h3 --test trusttunnel_config_test --retries 2 --no-fail-fast
+          # meow-config's own unit tests embed TrustTunnel fixtures too; only
+          # this scope compiles them with every TrustTunnel transport on.
+          cargo nextest run -p meow-config --features trusttunnel-h3 --lib --retries 2 --no-fail-fast
+
+      # One workspace-scoped invocation for every default-features test
+      # target. A single invocation keeps a single feature-resolution scope,
+      # so default targets share artifacts within this invocation instead
+      # of re-unifying features per `-p`-scoped step. The preceding opt-in
+      # TrustTunnel checks deliberately use separate feature scopes.
+      # `cargo test -p meow-dns --lib` was folded in: `--lib` already
+      # runs every crate's lib tests, meow-dns included.
+      - name: Unit + integration tests (default features)
+        env:
+          # Points restls_e2e's upstream-interop leg at the Go harness
+          # built above — without it that leg fails (never silently skips).
+          RESTLS_SERVER_BIN: ${{ runner.temp }}/restls-server
+          # Same contract for jls_e2e's upstream-interop leg.
+          JLS_SERVER_BIN: ${{ runner.temp }}/jls-server
+          # And for kcptun_e2e's all-real-peer suite.
+          KCPTUN_SERVER_BIN: ${{ runner.temp }}/kcptun-server
+        run: |
+          cargo nextest run --lib --bin meow --bin meow-bench \
+            --test common_test \
+            --test socks5_udp_user \
+            --test dns_cache_test \
+            --test config_test \
+            --test tun_config_test \
+            --test dialer_proxy_group \
+            --test statistics_test \
+            --test rules_test \
+            --test api_test \
+            --test raii_guard_test \
+            --test http_connection_close \
+            --test config_persistence_test \
+            --test systemd_config_test \
+            --test launchd_config_test \
+            --test trojan_integration \
+            --test vless_config_test \
+            --test vless_integration \
+            --test v2ray_plugin_integration \
+            --test gost_plugin_integration \
+            --test shadow_tls_test \
+            --test restls_e2e \
+            --test jls_e2e \
+            --test kcptun_e2e \
+            --test pre_resolve_test \
+            --test offline_config_test \
+            --test geodata_fetch_test \
+            --test subscription_refresh_test \
+            --test tls_test \
+            --test boring_tls_test \
+            --test ws_test \
+            --test crate_invariants_test \
+            --test crate_publish_metadata_test \
+            --test smux_singbox_integration --retries 2 --no-fail-fast
+
+      # `-p meow-api` builds api_test WITHOUT `listener-tun` (meow-app's
+      # `full` never enters the graph), so the `cfg(not(feature =
+      # "listener-tun"))` TUN-reconcile tests actually execute — in the
+      # unified invocation above feature unification compiles them out.
+      - name: API tests without listener-tun (TUN reconcile)
+        run: cargo nextest run -p meow-api --test api_test --retries 2 --no-fail-fast
+
+      - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
+        run: cargo nextest run -p meow-listener --all-features --lib udp_port_53 --retries 2 --no-fail-fast
+
+      # `ss_listener_integration` is `required-features = ["listener-shadowsocks"]`,
+      # which is opt-in (excluded from the app bundles and default features), so
+      # the default-features suite above never compiles it. The `--lib` leg runs
+      # the whole `shadowsocks::tests` module; the `--test` leg runs the suite.
+      - name: Shadowsocks listener tests (SIP022 UDP)
+        run: |
+          cargo nextest run -p meow-listener --features listener-shadowsocks --lib shadowsocks --retries 2 --no-fail-fast
+          cargo nextest run -p meow-listener --features listener-shadowsocks --test ss_listener_integration --retries 2 --no-fail-fast
+
+      # ADR-0008 allocation-count gates. Release build: the thresholds are
+      # calibrated against release codegen. The provider-backed pressure
+      # test self-skips when geodata files are absent (as on CI runners);
+      # the remaining gates run everywhere.
+      - name: Allocation-count gates (ADR-0008)
+        run: cargo nextest run -p meow-tunnel --test alloc_count_test --release --retries 2 --no-fail-fast
+
+      # Kept as its own step: MIHOMO_REQUIRE_INTEGRATION_BINS flips *every*
+      # suite that probes for external binaries from skip to fail (e.g.
+      # vless_integration probes for xray, which is not installed here), so
+      # it must only wrap the suite whose binaries are installed above.
+      - name: Shadowsocks integration tests (incl. simple-obfs)
+        env:
+          # Force-fail (instead of silently SKIP) if ssserver / obfs-local /
+          # obfs-server are missing on PATH — they are installed above.
+          MIHOMO_REQUIRE_INTEGRATION_BINS: "1"
+        run: cargo nextest run --test shadowsocks_integration --retries 2 --no-fail-fast
+
+      - name: Docker integration tests (Hysteria2 + Snell v3–v6 + Xray VMess/VLESS encryption/Vision)
+        env:
+          MEOW_REQUIRE_DOCKER: "1"
+        run: |
+          cargo nextest run -p meow-proxy --features "hysteria2,snell,vmess,vless-encryption,vless-vision" \
+            --test hysteria2_integration \
+            --test snell_server_docker_integration \
+            --test xray_server_docker_integration --retries 2 --no-fail-fast
+
+      - name: AnyTLS unit and integration tests (embedded server)
+        run: |
+          cargo nextest run -p meow-anytls --lib --retries 2 --no-fail-fast
+          cargo nextest run -p meow-proxy --features anytls --lib \
+            --test anytls_integration --test anytls_leak --retries 2 --no-fail-fast
+
+      # One invocation/feature set for the feature-gated transport suites.
+      # Per-feature-combination *compile* coverage (the old G1-G6 matrix)
+      # lives in the feature-powerset job; the nightly coverage workflow
+      # runs these same tests under --all-features.
+      - name: Transport feature-gated tests (gRPC / H2 / HTTPUpgrade / XHTTP)
+        run: |
+          cargo nextest run -p meow-transport --features "grpc,h2,httpupgrade,xhttp" \
+            --test grpc_test \
+            --test h2_test \
+            --test xhttp_test \
+            --test httpupgrade_test --retries 2 --no-fail-fast
+
+  features:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: features
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      # Capped powerset: --depth 2 covers the empty set, every single feature,
+      # and every pair — enough for the real-world cfg-interaction bugs while
+      # keeping the leg count ~n^2 instead of ~2^n (meow-proxy: 66 legs,
+      # ~129 across the four crates — cargo-hack dedups subsets that resolve
+      # to identical builds). Same trade-off tokio (--depth 2 --keep-going)
+      # and quinn (--depth 3 --no-dev-deps) make in their PR CI.
+      # --no-dev-deps: dev-dependencies are irrelevant to a compile check and
+      # dominate per-leg build time. Deeper combinations (3+ features) run
+      # nightly in .github/workflows/feature-powerset-daily.yml; the
+      # --all-features legs (transport G7, VLESS G3) are covered by clippy
+      # --all-features in the lint job.
+      - name: Feature powerset (depth 2) — meow-transport
+        # `tls` is BoringSSL (boring-sys builds once and is cached across
+        # legs); `boring-tls` is a no-op alias of it, so skip that duplicate.
+        run: cargo hack check -p meow-transport --feature-powerset --depth 2 --no-dev-deps --exclude-features boring-tls
+
+      - name: Feature powerset (depth 2) — meow-proxy
+        run: cargo hack check -p meow-proxy --feature-powerset --depth 2 --no-dev-deps
+
+      - name: Feature powerset (depth 2) — meow-listener
+        run: cargo hack check -p meow-listener --feature-powerset --depth 2 --no-dev-deps
+
+      - name: Feature powerset (depth 2) — meow-dns
+        run: cargo hack check -p meow-dns --feature-powerset --depth 2 --no-dev-deps
+
+  msrv:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read MSRV from workspace Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+          echo "MSRV: $msrv"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      # rust-toolchain.toml outranks `rustup default` — a directory
+      # override outranks the file, so without this the check would
+      # silently run on the pin (and rust-cache would key on it too).
+      - run: rustup override set ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: msrv-${{ steps.msrv.outputs.version }}
+
+      - name: Cargo check on MSRV toolchain
+        run: cargo check --workspace --all-targets
+
+  windows:
+    runs-on: windows-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+
+      # No `components:` — the clippy steps run in the checkout, where
+      # rust-toolchain.toml resolves the pin and auto-installs its
+      # declared components; @stable only provides rustup + a fallback.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: windows
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # lwIP (listener-tun, in the `full` default bundle) uses bindgen.
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18"
+
+      - name: Fetch wintun.dll
+        shell: bash
+        run: |
+          bash scripts/fetch-wintun.sh --target x86_64-pc-windows-msvc --outdir "$RUNNER_TEMP/wintun"
+          echo "MEOW_WINTUN_DLL=$RUNNER_TEMP/wintun/wintun.dll" >> "$GITHUB_ENV"
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Build
+        run: cargo build --tests
+
+      # Single workspace-scoped invocation — same rationale as the ubuntu
+      # test job: one feature-resolution scope, no per-step rebuilds (the
+      # old `-p`-scoped steps re-unified features and spent minutes
+      # relinking on the Windows runner).
+      - name: Unit + integration tests (windows)
+        shell: bash
+        run: |
+          cargo nextest run --lib --bin meow --bin meow-bench \
+            --test common_test \
+            --test config_test \
+            --test rules_test \
+            --test api_test \
+            --test trojan_integration \
+            --test tls_test \
+            --test boring_tls_test \
+            --test ws_test \
+            --test crate_publish_metadata_test --retries 2 --no-fail-fast
+
+      # TUN inbound tests: `listener-tun` is not a default feature, so the
+      # workspace --lib leg above never compiles or runs the tun module's
+      # tests. This leg covers the Windows-only DnsGuard logic (backup
+      # filtering, batched restore-script generation, and a read-only smoke
+      # test of the real PowerShell/registry backup path) plus the
+      # platform-neutral TUN routing-loop guard.
+      - name: meow-listener TUN tests (listener-tun)
+        run: cargo nextest run -p meow-listener --features listener-tun --lib --retries 2 --no-fail-fast
+
+  macos:
+    runs-on: macos-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: macos
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Build
+        run: cargo build --tests
+
+      - name: Core smoke tests
+        run: |
+          cargo nextest run --lib --bin meow --bin meow-bench \
+            --test common_test \
+            --test config_test \
+            --test rules_test \
+            --test api_test \
+            --test trojan_integration \
+            --test tls_test \
+            --test boring_tls_test \
+            --test ws_test \
+            --test crate_publish_metadata_test --retries 2 --no-fail-fast
+
+      # `listener-tun` is not a default feature; this leg runs the tun
+      # module's tests — notably the macOS regression guard that an unset
+      # `tun.device` never invents a name (tun-rs rejects non-`utunN`).
+      - name: meow-listener TUN tests (listener-tun)
+        run: cargo nextest run -p meow-listener --features listener-tun --lib --retries 2 --no-fail-fast
+
+  tproxy:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: TProxy integration tests
+        env:
+          MEOW_REQUIRE_DOCKER: "1"
+        run: bash tests/test_tproxy_docker.sh
+
+  # OpenWrt packaging and gateway e2e: native Docker router, origin and LAN
+  # clients verify package installation, LuCI, lifecycle and TCP/UDP routing.
+  openwrt:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+
+      # The musl target must be added to the *pinned* toolchain cargo
+      # resolves via rust-toolchain.toml — a `targets:` input on `@stable`
+      # would install it on the wrong channel.
+      - name: Read pinned toolchain channel
+        id: tc
+        # sed (not grep | sed): tolerates leading whitespace and a quoted
+        # trailing comment, prints nothing on no match; the empty check
+        # keeps a malformed toml fail-loud instead of writing `channel=`.
+        run: |
+          tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          if [ -z "$tc" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "channel=$tc" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.tc.outputs.channel }}
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: openwrt-e2e
+
+      - name: Install cargo-zigbuild and zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - run: cargo install --locked cargo-zigbuild
+
+      - name: OpenWrt Docker e2e tests
+        env:
+          MEOW_REQUIRE_DOCKER: "1"
+        run: bash tests/test_openwrt_docker.sh
+
+  # OpenWrt .apk packaging (apk-tools v3, OpenWrt 25.12+; #466): builds both
+  # packages with build-apk.sh, checks them with `apk verify` / `apk adbdump`,
+  # and installs them into a real OpenWrt 25.12 rootfs container.
+  openwrt-apk:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache apk-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/apk-tools
+          key: apk-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('openwrt/install-apk-tools.sh') }}
+
+      - name: Install apk-tools 3 (pinned)
+        run: bash openwrt/install-apk-tools.sh "$HOME/.cache/apk-tools"
+
+      - name: Build, verify and install the apks
+        env:
+          MEOW_REQUIRE_DOCKER: "1"
+        run: |
+          APK="$HOME/.cache/apk-tools/apk" bash tests/test_openwrt_apk.sh

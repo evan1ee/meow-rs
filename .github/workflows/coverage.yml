@@ -1,0 +1,115 @@
+name: Coverage
+
+on:
+  schedule:
+    # Nightly at 02:17 UTC — offset to avoid shared runner load at top of hour.
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    # Nightly schedule also fires on forks that enable Actions — don't burn
+    # fork owners' minutes on a run that cannot upload without upstream's
+    # Codecov token anyway.
+    if: github.event.repository.fork == false
+    steps:
+      - uses: actions/checkout@v5
+
+      # llvm-tools-preview must land on the *pinned* toolchain cargo
+      # resolves via rust-toolchain.toml — a bare `@stable` step would
+      # install the component on the wrong channel.
+      - name: Read pinned toolchain channel
+        id: tc
+        # sed (not grep | sed): tolerates leading whitespace and a quoted
+        # trailing comment, prints nothing on no match; the empty check
+        # keeps a malformed toml fail-loud instead of writing `channel=`.
+        run: |
+          tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          if [ -z "$tc" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "channel=$tc" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.tc.outputs.channel }}
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache ssserver binary
+        id: cache-ssserver
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/ssserver
+          key: ssserver-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install ssserver
+        if: steps.cache-ssserver.outputs.cache-hit != 'true'
+        # --force: on a Cargo.lock change this step's cache misses, but the
+        # rust-cache restore may already have an ssserver in ~/.cargo/bin,
+        # and a plain `cargo install` refuses to overwrite it (same trap as
+        # test.yml's install step).
+        run: cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --locked --force
+
+      - name: Install simple-obfs
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends simple-obfs
+
+      # The real-server smux E2E (smux_singbox_integration) REFUSES to
+      # silently skip without this binary. Keep the version in sync with
+      # SINGBOX_VERSION in crates/meow-app/tests/smux_singbox_integration.rs
+      # and with the test.yml install step.
+      - name: Install sing-box (real-server smux E2E)
+        run: |
+          set -euo pipefail
+          SINGBOX_VERSION=1.14.0
+          curl -fsSL -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          command -v sing-box
+
+      - name: Collect coverage
+        env:
+          MIHOMO_REQUIRE_INTEGRATION_BINS: "1"
+        run: |
+          # `--include-ignored` runs local-process integration tests (ssserver,
+          # simple-obfs, embedded mock servers). Tests in
+          # crates/meow-dns/tests/doh_dot_integration.rs require outbound
+          # internet (Cloudflare/Google DoH/DoT) and are not reachable from
+          # GitHub-hosted runners — skip them by name. The mux `live_singbox_*`
+          # interop probes require a manually started sing-box server
+          # (127.0.0.1:4411, see target/e2e/mux-interop/) — also skip.
+          cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info \
+            -- --include-ignored \
+               --skip dot_resolves_example_com \
+               --skip doh_resolves_example_com \
+               --skip dot_bogus_sni_fails_cert_validation \
+               --skip doh_bogus_sni_fails_cert_validation \
+               --skip dot_hostname_with_bootstrap_resolves \
+               --skip geosite_rss_10k_rules_100k_queries \
+               --skip live_download_from_default_urls \
+               --skip live_singbox
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
