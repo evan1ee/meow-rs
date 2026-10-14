@@ -476,6 +476,30 @@ async fn v3_server_strict_mode_rejects_tls12_cover() {
     assert!(!err.is_empty(), "dial against a strict server must fail");
 }
 
+/// A relay-supplied stream (a `relay` chain hop) runs the same ShadowTLS
+/// handshake as a fresh dial and carries SS end to end.
+#[tokio::test]
+async fn v3_over_relay_supplied_stream() {
+    let Some(relay) = spawn_relay(CoverTls::V13, false).await else {
+        return;
+    };
+    let adapter = adapter(relay.port, &base_opts(STLS_PASSWORD));
+    let tcp = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+    let stream = meow_proxy::stream_conn::StreamConn(Box::new(tcp));
+    let mut conn = timeout(TIMEOUT, adapter.connect_over(Box::new(stream), &metadata()))
+        .await
+        .expect("connect_over timed out")
+        .expect("ss connect_over through shadow-tls");
+    conn.write_all(b"relay-hop").await.unwrap();
+    conn.flush().await.unwrap();
+    let mut buf = [0u8; 9];
+    timeout(TIMEOUT, conn.read_exact(&mut buf))
+        .await
+        .expect("relay-hop echo timed out")
+        .expect("relay-hop echo");
+    assert_eq!(&buf, b"relay-hop");
+}
+
 /// Nothing listening at the configured server port — a connection error
 /// surfaces promptly instead of hanging.
 #[tokio::test]
@@ -760,4 +784,219 @@ async fn v3_without_uot_refuses_udp() {
         .err()
         .expect("plain UDP must be refused");
     assert!(err.to_string().contains("shadow-tls"), "{err}");
+}
+
+// ─── Snell (`obfs-opts.mode: shadow-tls`) through the official relay ───────
+//
+//   meow Snell v4 (+ shadow-tls v3 obfs) ──TCP──> official shadow-tls
+//     ──> loopback Snell v4 server (meow's symmetric codec) ──echo
+//
+// The Snell AEAD codec is symmetric, so wrapping an accepted socket in
+// `V4Conn` speaks the server side (same trick as `snell_integration`).
+
+#[cfg(feature = "snell")]
+mod snell_legs {
+    use super::*;
+    use meow_proxy::shadow_tls_plugin;
+    use meow_proxy::snell::protocol::{
+        COMMAND_UDP, COMMAND_UDP_FORWARD, HEADER_VERSION, RESPONSE_TUNNEL,
+    };
+    use meow_proxy::snell::v4::{is_zero_chunk, V4Conn};
+    use meow_proxy::snell::{SnellAdapter, SnellObfs, SnellVersion};
+
+    const SNELL_PSK: &str = "stls-e2e-snell-psk";
+
+    /// Snell v4 echo server: CONNECT sessions echo bytes; UDP sessions
+    /// echo each `[cmd, 0, family, ip, port, payload]` frame back as
+    /// `[family, ip, port, payload]`.
+    async fn spawn_snell_echo() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut conn = V4Conn::new(tcp, Arc::from(SNELL_PSK.as_bytes()));
+                    let mut prefix = [0u8; 3];
+                    if conn.read_exact(&mut prefix).await.is_err() || prefix[0] != HEADER_VERSION {
+                        return;
+                    }
+                    if prefix[1] != COMMAND_UDP {
+                        let mut len = [0u8; 1];
+                        if conn.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut rest = vec![0u8; len[0] as usize + 2];
+                        if conn.read_exact(&mut rest).await.is_err() {
+                            return;
+                        }
+                    }
+                    if conn.write_all(&[RESPONSE_TUNNEL]).await.is_err()
+                        || conn.flush().await.is_err()
+                    {
+                        return;
+                    }
+                    let udp = prefix[1] == COMMAND_UDP;
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = match conn.read(&mut buf).await {
+                            Ok(0) => return,
+                            Ok(n) => n,
+                            Err(e) if is_zero_chunk(&e) => return,
+                            Err(_) => return,
+                        };
+                        let reply = if udp {
+                            let f = &buf[..n];
+                            if f.len() < 3 || f[0] != COMMAND_UDP_FORWARD || f[1] != 0 {
+                                return;
+                            }
+                            f[2..].to_vec()
+                        } else {
+                            buf[..n].to_vec()
+                        };
+                        if conn.write_all(&reply).await.is_err() || conn.flush().await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn snell_adapter(port: u16, stls_password: &str, udp: bool) -> SnellAdapter {
+        let config = shadow_tls_plugin::parse_opts(&base_opts(stls_password)).unwrap();
+        SnellAdapter::new(
+            "snell-shadowtls",
+            "127.0.0.1",
+            port,
+            SNELL_PSK,
+            SnellObfs::ShadowTls {
+                config: Box::new(config),
+                client_fingerprint: Some("chrome".into()),
+            },
+            SnellVersion::V4,
+            udp,
+            false,
+            Arc::new(DirectDialer),
+        )
+        .expect("snell + shadow-tls adapter")
+    }
+
+    async fn relay_to_snell() -> Option<Relay> {
+        let backend = spawn_snell_echo().await;
+        spawn_relay_to(backend).await
+    }
+
+    #[tokio::test]
+    async fn snell_v4_tcp_over_shadow_tls() {
+        let Some(relay) = relay_to_snell().await else {
+            return;
+        };
+        let adapter = snell_adapter(relay.port, STLS_PASSWORD, false);
+        let mut conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata()))
+            .await
+            .expect("snell dial timed out")
+            .expect("snell over shadow-tls dial");
+        for round in 0..3 {
+            let payload = format!("snell over shadow-tls {round}");
+            conn.write_all(payload.as_bytes()).await.unwrap();
+            conn.flush().await.unwrap();
+            let mut buf = vec![0u8; payload.len()];
+            timeout(TIMEOUT, conn.read_exact(&mut buf))
+                .await
+                .expect("snell echo timed out")
+                .expect("snell echo");
+            assert_eq!(buf, payload.as_bytes());
+        }
+        // Multi-record bulk in both directions.
+        let bulk: Vec<u8> = (0..200 * 1024u32).map(|i| (i % 249) as u8).collect();
+        let (mut rd, mut wr) = tokio::io::split(conn);
+        let expect = bulk.clone();
+        let writer = tokio::spawn(async move {
+            wr.write_all(&bulk).await.unwrap();
+            wr.flush().await.unwrap();
+            wr
+        });
+        let mut got = vec![0u8; expect.len()];
+        timeout(TIMEOUT, rd.read_exact(&mut got))
+            .await
+            .expect("snell bulk timed out")
+            .expect("snell bulk");
+        assert!(got == expect, "snell bulk corrupted");
+        writer.await.unwrap();
+    }
+
+    /// Snell's UDP (its own UDP-over-TCP command) opens through the same
+    /// obfs step, so its datagrams cross the ShadowTLS transport too.
+    #[tokio::test]
+    async fn snell_v4_udp_over_shadow_tls() {
+        let Some(relay) = relay_to_snell().await else {
+            return;
+        };
+        let adapter = snell_adapter(relay.port, STLS_PASSWORD, true);
+        let dst: SocketAddr = "1.2.3.4:5353".parse().unwrap();
+        let pc = timeout(TIMEOUT, adapter.dial_udp(&udp_metadata(dst)))
+            .await
+            .expect("snell udp dial timed out")
+            .expect("snell udp over shadow-tls");
+        let mut buf = [0u8; 2048];
+        for payload in [&b"q"[..], &[0x5a; 1200][..]] {
+            pc.write_packet(payload, &dst).await.unwrap();
+            let (n, from) = timeout(TIMEOUT, pc.read_packet(&mut buf))
+                .await
+                .expect("snell udp echo timed out")
+                .expect("snell udp echo");
+            assert_eq!((&buf[..n], from), (payload, dst));
+        }
+    }
+
+    /// Wrong ShadowTLS password: the relay degrades to an SNI proxy for the
+    /// cover; snell must fail the dial, never fall back to plain snell.
+    #[tokio::test]
+    async fn snell_wrong_shadow_tls_password_fails() {
+        let Some(relay) = relay_to_snell().await else {
+            return;
+        };
+        let adapter = snell_adapter(relay.port, "not-the-password", false);
+        let res = timeout(TIMEOUT, adapter.dial_tcp(&metadata()))
+            .await
+            .expect("failing dial must not hang");
+        let err = match res {
+            Err(e) => e.to_string(),
+            Ok(mut conn) => {
+                let _ = conn.write_all(b"probe").await;
+                let mut b = [0u8; 8];
+                match timeout(TIMEOUT, conn.read(&mut b)).await {
+                    Ok(Ok(n)) if n > 0 => panic!("must not echo through a bad relay"),
+                    Ok(Ok(_)) => "eof".into(),
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => panic!("must not hang"),
+                }
+            }
+        };
+        assert!(err.contains("shadow-tls") || err.contains("hmac"), "{err}");
+    }
+
+    /// A relay-supplied stream (relay chain hop) gets the same handshake.
+    #[tokio::test]
+    async fn snell_shadow_tls_over_relay_supplied_stream() {
+        let Some(relay) = relay_to_snell().await else {
+            return;
+        };
+        let adapter = snell_adapter(relay.port, STLS_PASSWORD, false);
+        let tcp = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+        let stream = meow_proxy::stream_conn::StreamConn(Box::new(tcp));
+        let mut conn = timeout(TIMEOUT, adapter.connect_over(Box::new(stream), &metadata()))
+            .await
+            .expect("connect_over timed out")
+            .expect("snell connect_over through shadow-tls");
+        conn.write_all(b"relay-hop").await.unwrap();
+        conn.flush().await.unwrap();
+        let mut buf = [0u8; 9];
+        timeout(TIMEOUT, conn.read_exact(&mut buf))
+            .await
+            .expect("relay-hop echo timed out")
+            .expect("relay-hop echo");
+        assert_eq!(&buf, b"relay-hop");
+    }
 }
