@@ -3946,6 +3946,15 @@ tls: true
     /// TLS to a ShadowTLS relay, which forwards it to the real cover.
     #[test]
     fn test_reject_unsupported_transport_opts() {
+        #[cfg_attr(
+            not(any(
+                feature = "trojan",
+                feature = "vless",
+                feature = "vmess",
+                feature = "snell"
+            )),
+            allow(unused_mut, reason = "every typed node below is feature-gated")
+        )]
         let mut nodes: Vec<(&str, String)> = vec![(
             "socks5",
             "name: k\ntype: socks5\nserver: 1.2.3.4\nport: 1080\n".into(),
