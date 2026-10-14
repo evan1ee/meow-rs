@@ -186,7 +186,7 @@ cargo test --lib --bin meow --bin meow-bench \
   --test launchd_config_test \
   --test trojan_integration --test vless_config_test --test vless_integration \
   --test v2ray_plugin_integration --test gost_plugin_integration \
-  --test shadow_tls_test --test shadow_tls_v3_e2e \
+  --test shadow_tls_test --test shadow_tls_v3_e2e --test shadow_tls_external_interop \
   --test restls_e2e --test jls_e2e --test kcptun_e2e --test pre_resolve_test \
   --test offline_config_test \
   --test geodata_fetch_test \
@@ -227,14 +227,18 @@ jls-server .`); `MEOW_JLS_E2E_ALLOW_SKIP=1` prints a loud explicit
 skip for local runs only — CI builds the harness via `actions/setup-go`
 and never sets it.
 
-`shadow_tls_v3_e2e` drives the SS (`chacha20-ietf-poly1305`) + shadow-tls
-v3 client against the **official** `ihciah/shadow-tls` server (TLS 1.3 and
-TLS 1.2 covers, auth/strict-mode failures) and **fails** when
-`SHADOWTLS_SERVER_BIN` is unset — fetch the pinned release with
+`shadow_tls_v3_e2e` drives the SS (`chacha20-ietf-poly1305`) and Snell
+shadow-tls v3 clients against the **official** `ihciah/shadow-tls` server
+(TLS 1.3 and TLS 1.2 covers, auth/strict-mode failures, relay hops, and
+SS `udp-over-tcp` v1/v2 into a sing-box UoT backend) and **fails** when
+`SHADOWTLS_SERVER_BIN` or sing-box (`$SINGBOX_BIN` / PATH) is missing —
+fetch the pinned release with
 `bash scripts/fetch-shadowtls-server.sh /tmp/meow-stls` and export
 `SHADOWTLS_SERVER_BIN=/tmp/meow-stls/shadow-tls`;
 `MEOW_SHADOWTLS_E2E_ALLOW_SKIP=1` prints a loud explicit skip for local
 runs only — CI fetches the binary and never sets it.
+`shadow_tls_external_interop` targets a real deployed server and runs only
+with `MEOW_SHADOWTLS_EXTERNAL=1` (see its header); otherwise it skips.
 
 `kcptun_e2e` drives the full SS → smux → snappy → KCP → crypt/FEC stack
 against a real upstream Go peer (kcp-go + xtaci/smux + go-shadowsocks2).

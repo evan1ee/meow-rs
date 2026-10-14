@@ -210,10 +210,12 @@ jobs:
       - name: Build
         run: cargo build --tests
 
-      # shadow_tls_v3_e2e drives the SS + shadow-tls v3 client against the
-      # official ihciah/shadow-tls server (the protocol's reference
-      # implementation). Every leg is real-peer: without
-      # SHADOWTLS_SERVER_BIN the suite fails rather than skipping.
+      # shadow_tls_v3_e2e drives the SS / Snell + shadow-tls v3 clients
+      # against the official ihciah/shadow-tls server (the protocol's
+      # reference implementation); its udp-over-tcp legs use the sing-box
+      # installed above as the UoT backend. Every leg is real-peer: without
+      # SHADOWTLS_SERVER_BIN (or sing-box) the suite fails rather than
+      # skipping. shadow_tls_external_interop is opt-in and skips in CI.
       - name: Fetch official shadow-tls server (pinned, SHA256 verified)
         run: bash scripts/fetch-shadowtls-server.sh "$RUNNER_TEMP/shadow-tls"
 
@@ -282,6 +284,7 @@ jobs:
             --test gost_plugin_integration \
             --test shadow_tls_test \
             --test shadow_tls_v3_e2e \
+            --test shadow_tls_external_interop \
             --test restls_e2e \
             --test jls_e2e \
             --test kcptun_e2e \

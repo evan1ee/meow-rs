@@ -15,7 +15,7 @@
 //! | `version` | protocol version 1, 2 or 3 | `2` (upstream default) |
 //! | `alpn` | comma-separated ALPN list for the cover handshake | `h2,http/1.1` |
 //! | `skip-cert-verify` | disable cover cert verification | `false` |
-//! | `name-cert-verify` | cert-verify hostname when it differs from SNI — meow extension, upstream ignores this key | `host` |
+//! | `name-cert-verify` | cert-verify hostname when it differs from SNI (upstream `NameCertVerify`) | `host` |
 //! | `fingerprint` | SHA-256 **certificate pin** (upstream
 //!   `FingerprintVerifier`), *not* a uTLS profile | — |
 //! | `certificate` / `private-key` | mTLS pair — inline PEM or file path | — |
@@ -66,8 +66,7 @@ pub struct ShadowTlsConfig {
     pub alpn: Vec<String>,
     pub skip_cert_verify: bool,
     /// Cert-verify hostname when it differs from `host`/SNI
-    /// (`name-cert-verify` — a meow extension; mihomo's
-    /// `shadowTLSOption` has no such field and warn-ignores it).
+    /// (`name-cert-verify`, upstream `shadowTLSOption.NameCertVerify`).
     pub verify_name: Option<String>,
     /// SHA-256 certificate pin (`fingerprint` — SSL pinning per upstream
     /// `ca.NewFingerprintVerifier`, *not* a uTLS ClientHello profile).

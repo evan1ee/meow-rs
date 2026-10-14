@@ -10,6 +10,19 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Shadowsocks `udp-over-tcp`** (`udp-over-tcp-version: 1|2`, mihomo
+  `UDPOverTCP`): each UDP association rides one SS TCP stream to the UoT
+  magic destination, dialed through the node's plugin transport. With
+  `plugin: shadow-tls` the datagrams travel inside authenticated ShadowTLS
+  records and are never sent as SS UDP. Needs a UoT-capable server
+  (sing-box / mihomo); interop-tested against sing-box 1.14 for both
+  versions.
+- **Snell `obfs-opts.mode: shadow-tls`** (v3–v5): the same options and
+  handshake as the SS plugin. Snell's TCP, UDP and relay-hop connections
+  all run through it.
+- **shadow-tls on relay-chain hops**: SS and Snell shadow-tls nodes now run
+  the handshake over a relay-supplied stream instead of refusing it.
+
 - Opt-in TrustTunnel client outbound (`--features trusttunnel`):
   authenticated CONNECT, TCP half-close, bounded pooling and IPv4/IPv6 UDP
   multiplexing over HTTP/2, plus the specification's per-stream `user-agent`
@@ -25,6 +38,20 @@ the canonical, in-repo source a release is cut from.
   `x86_64-unknown-linux-musl` binary, so `luci-app-meow` can be installed on
   x86 OpenWrt.
 
+### Changed
+
+- **shadow-tls `version` defaults to 2** when `plugin-opts.version` is
+  omitted, matching mihomo. It was previously a config error. Set
+  `version: 3` explicitly for v3 servers.
+- **Unsupported transport options now fail at config load** instead of
+  being silently ignored (Class A per ADR-0002):
+  - `shadow-tls-opts` / `restls-opts` / `jls-opts` on any proxy type. On
+    trojan, an ignored `shadow-tls-opts` would have sent plain TLS, and the
+    password hash, to the real cover site through the relay.
+  - `udp-over-tcp: true` on non-SS types.
+  - `udp-over-tcp-version: 2` on kcptun nodes.
+  - Snell's `obfs-opts.mode: restls|jls` now gets a specific error.
+
 ### Fixed
 
 - **shadow-tls v3 against the official server**: sessions through
@@ -35,7 +62,7 @@ the canonical, in-repo source a release is cut from.
   as its Finished is sent. An interop suite against the official server
   (`shadow_tls_v3_e2e`, binary pinned by `scripts/fetch-shadowtls-server.sh`)
   now runs in CI; see `docs/plugins/shadow-tls.md` for configuration and
-  limits (no UDP on shadow-tls nodes; TLS 1.3 covers recommended).
+  limits (UDP only via `udp-over-tcp`; TLS 1.3 covers recommended).
 
 - **LuCI notifications on OpenWrt 23.05 and 24.10.0**: configuration
   validation/saves, service actions, and client updates no longer report
