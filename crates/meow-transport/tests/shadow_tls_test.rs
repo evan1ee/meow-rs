@@ -832,3 +832,301 @@ async fn v3_connection_errors_mid_handshake() {
         server.await.unwrap();
     }
 }
+
+// ─── v3 robustness: fragmentation, partial IO, cancellation, timeouts ───────
+
+/// Wraps a stream so every read returns at most a few bytes and every
+/// write accepts at most a few — TLS records then arrive split across
+/// many reads (record reassembly) and the TLS stack's writes are partial
+/// (the ClientHello patcher's write-side assembly).
+struct Choppy<S> {
+    inner: S,
+    tick: usize,
+}
+
+impl<S> Choppy<S> {
+    fn new(inner: S) -> Self {
+        Self { inner, tick: 0 }
+    }
+    /// Deterministic 1..=7 chunk size.
+    fn next_len(&mut self) -> usize {
+        self.tick = self.tick.wrapping_mul(31).wrapping_add(7);
+        1 + self.tick % 7
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Choppy<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let cap = self.next_len().min(buf.remaining());
+        let mut tmp = [0u8; 8];
+        let mut small = tokio::io::ReadBuf::new(&mut tmp[..cap]);
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, &mut small) {
+            std::task::Poll::Ready(Ok(())) => {
+                buf.put_slice(small.filled());
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Choppy<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let cap = self.next_len().min(5).min(buf.len());
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..cap])
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Mock v3 relay that, after the switch, echoes every verified client
+/// record back under the "S" chain until the client hangs up — a
+/// multi-record data phase (the single-shot `v3_relay_server` stops
+/// after one payload).
+async fn v3_echo_relay(mut tcp: TcpStream, conn: &mut ServerConnection, password: &[u8]) {
+    let mut asm = OutAssembler::new(3, password);
+    let mut chains: Option<(HmacSha1, HmacSha1)> = None; // (verify "C", add "S")
+    let ch = read_record(&mut tcp).await.unwrap();
+    verify_ch_tag(&ch, password);
+    conn.read_tls(&mut &ch[..]).unwrap();
+    conn.process_new_packets().expect("cover TLS");
+    let mut cover_dead = false;
+    let first = loop {
+        while !cover_dead && conn.wants_write() {
+            let mut produced = Vec::new();
+            conn.write_tls(&mut produced).unwrap();
+            let wire = asm.feed(&produced);
+            if chains.is_none() {
+                if let Some(sr) = asm.server_random {
+                    let mut v = sha1_hmac(password);
+                    v.update(&sr);
+                    v.update(b"C");
+                    let mut a = sha1_hmac(password);
+                    a.update(&sr);
+                    a.update(b"S");
+                    chains = Some((v, a));
+                }
+            }
+            tcp.write_all(&wire).await.unwrap();
+        }
+        let Ok(rec) = read_record(&mut tcp).await else {
+            return;
+        };
+        if let Some((v, _)) = &chains {
+            if rec[0] == 23 && rec.len() > RECORD_HDR + 4 {
+                let mut probe = v.clone();
+                probe.update(&rec[RECORD_HDR + 4..]);
+                if rec[RECORD_HDR..RECORD_HDR + 4] == probe.finalize().into_bytes()[..4] {
+                    break rec;
+                }
+            }
+        }
+        if !cover_dead {
+            let _ = conn.read_tls(&mut &rec[..]);
+            cover_dead = conn.process_new_packets().is_err();
+        }
+    };
+    let (mut verify, mut add) = chains.expect("chains seeded");
+    let mut rec = first;
+    loop {
+        // Verify under the rolling "C" chain (upstream `verifiedRelay`).
+        let payload = rec[RECORD_HDR + 4..].to_vec();
+        verify.update(&payload);
+        let tag = verify.clone().finalize().into_bytes();
+        assert_eq!(
+            &rec[RECORD_HDR..RECORD_HDR + 4],
+            &tag[..4],
+            "client C-chain tag"
+        );
+        verify.update(&tag[..4]);
+        // Echo under the rolling "S" chain.
+        add.update(&payload);
+        let etag = add.clone().finalize().into_bytes();
+        add.update(&etag[..4]);
+        let mut out = vec![23u8, 3, 3];
+        out.extend(((payload.len() + 4) as u16).to_be_bytes());
+        out.extend(&etag[..4]);
+        out.extend(&payload);
+        if tcp.write_all(&out).await.is_err() {
+            return;
+        }
+        rec = match read_record(&mut tcp).await {
+            Ok(r) if r[0] == 23 => r,
+            _ => return, // EOF / alert: the client hung up
+        };
+    }
+}
+
+async fn spawn_v3_echo_relay() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, TlsLayer) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut conn, cert) = server_conn();
+    let handle = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        v3_echo_relay(tcp, &mut conn, PASSWORD).await;
+    });
+    (addr, handle, client_layer(3, &cert))
+}
+
+/// Full v3 handshake + multi-record data with every read returning 1–7
+/// bytes and every write accepting ≤5: record reassembly, the patcher's
+/// write-side buffering and the framed reader all see maximal
+/// fragmentation; the payload must still round-trip intact.
+#[tokio::test]
+async fn v3_survives_fragmented_reads_and_partial_writes() {
+    install_crypto_provider();
+    let (addr, server, layer) = spawn_v3_echo_relay().await;
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let mut s =
+        meow_transport::shadow_tls::dial(Box::new(Choppy::new(tcp)), &layer, 3, PASSWORD, false)
+            .await
+            .expect("v3 dial over a fragmenting stream");
+    // > one 16 KiB record each way, written in odd-sized pieces.
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 253) as u8).collect();
+    let mut got = Vec::with_capacity(payload.len());
+    for chunk in payload.chunks(9_973) {
+        s.write_all(chunk).await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = vec![0u8; chunk.len()];
+        tokio::time::timeout(std::time::Duration::from_secs(10), s.read_exact(&mut buf))
+            .await
+            .expect("fragmented echo timed out")
+            .unwrap();
+        got.extend(buf);
+    }
+    assert!(got == payload, "payload corrupted under fragmentation");
+    drop(s);
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("relay must see the hang-up")
+        .unwrap();
+}
+
+/// Cancelling a dial mid-handshake (caller dropped the future) releases
+/// the socket: the peer observes EOF promptly instead of a leaked conn.
+#[tokio::test]
+async fn v3_cancelled_dial_releases_connection() {
+    install_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_, cert) = server_conn();
+    let server = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let ch = read_record(&mut tcp).await.unwrap();
+        verify_ch_tag(&ch, PASSWORD);
+        // Never answer; wait for the client side to go away.
+        let mut b = [0u8; 64];
+        loop {
+            match tcp.read(&mut b).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    });
+    let layer = client_layer(3, &cert);
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let dial = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD, false);
+    let res = tokio::time::timeout(std::time::Duration::from_millis(200), dial).await;
+    assert!(
+        res.is_err(),
+        "dial against a silent relay must not complete"
+    );
+    // The timeout dropped the dial future (and its socket).
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("relay must observe the cancelled client's EOF")
+        .unwrap();
+}
+
+/// A relay that stalls after its ServerHello (half a handshake) cannot
+/// wedge the caller: an outer timeout bounds the dial and nothing on the
+/// client side blocks past it.
+#[tokio::test]
+async fn v3_stalled_relay_is_bounded_by_caller_timeout() {
+    install_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut conn, cert) = server_conn();
+    let server = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let ch = read_record(&mut tcp).await.unwrap();
+        conn.read_tls(&mut &ch[..]).unwrap();
+        conn.process_new_packets().unwrap();
+        // Forward only the ServerHello record, then go silent.
+        let mut produced = Vec::new();
+        while conn.wants_write() {
+            conn.write_tls(&mut produced).unwrap();
+        }
+        let sh_len = RECORD_HDR + u16::from_be_bytes([produced[3], produced[4]]) as usize;
+        tcp.write_all(&produced[..sh_len]).await.unwrap();
+        let mut b = [0u8; 64];
+        while matches!(tcp.read(&mut b).await, Ok(n) if n > 0) {}
+    });
+    let layer = client_layer(3, &cert);
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let started = std::time::Instant::now();
+    let res = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD, false),
+    )
+    .await;
+    assert!(res.is_err(), "half a handshake must not authorize");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("stalled relay must see the client go away")
+        .unwrap();
+}
+
+/// Independent concurrent sessions (each its own server random and
+/// rolling chains) neither cross-talk nor leak: every relay task ends
+/// once its client hangs up.
+#[tokio::test]
+async fn v3_concurrent_sessions_are_isolated_and_cleaned_up() {
+    install_crypto_provider();
+    let mut tasks = Vec::new();
+    for i in 0..8u8 {
+        tasks.push(tokio::spawn(async move {
+            let (addr, server, layer) = spawn_v3_echo_relay().await;
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut s = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD, false)
+                .await
+                .expect("concurrent v3 dial");
+            for round in 0..3u8 {
+                let msg = vec![i ^ round; 3000 + usize::from(i) * 100];
+                s.write_all(&msg).await.unwrap();
+                s.flush().await.unwrap();
+                let mut buf = vec![0u8; msg.len()];
+                s.read_exact(&mut buf).await.unwrap();
+                assert_eq!(buf, msg, "session {i} round {round}");
+            }
+            s.shutdown().await.unwrap();
+            drop(s);
+            tokio::time::timeout(std::time::Duration::from_secs(10), server)
+                .await
+                .expect("relay task must finish after client shutdown")
+                .unwrap();
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+}
