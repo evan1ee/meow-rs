@@ -490,3 +490,274 @@ async fn v3_connection_refused_surfaces() {
     let err = dial_err(&adapter(port, &base_opts(STLS_PASSWORD))).await;
     assert!(!err.is_empty(), "connection refused must surface an error");
 }
+
+// ─── UDP-over-TCP through ShadowTLS (sing-box UoT backend) ─────────────────
+//
+//   meow SS (+ shadow-tls v3 + udp-over-tcp) ──TCP──> official shadow-tls
+//     ──> sing-box SS inbound (UoT server, both versions) ──UDP──> echo
+//
+// The client knows only the relay's TCP port: there is no SS UDP endpoint
+// anywhere in its config, so a datagram that came back proves it crossed
+// the ShadowTLS transport inside the SS stream.
+
+/// Pinned sing-box release (kept in sync with the CI install step).
+const SINGBOX_VERSION: &str = "1.14.0";
+
+/// `$SINGBOX_BIN`, else `sing-box` on PATH; fail-closed like the relay.
+fn singbox_binary() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("SINGBOX_BIN") {
+        let p = PathBuf::from(p);
+        assert!(p.is_file(), "SINGBOX_BIN is not a file: {p:?}");
+        return Some(p);
+    }
+    if let Some(found) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("sing-box"))
+            .find(|p| p.is_file())
+    }) {
+        return Some(found);
+    }
+    assert_eq!(
+        std::env::var("MEOW_SHADOWTLS_E2E_ALLOW_SKIP")
+            .ok()
+            .as_deref(),
+        Some("1"),
+        "shadow_tls_v3_e2e UoT legs require sing-box {SINGBOX_VERSION} \
+         ($SINGBOX_BIN or PATH) — or set MEOW_SHADOWTLS_E2E_ALLOW_SKIP=1 locally"
+    );
+    eprintln!("SKIP: shadow_tls_v3_e2e UoT — sing-box not found (allowed)");
+    None
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A running sing-box SS inbound; the temp config lives as long as it.
+struct SingBox {
+    _child: Child,
+    _dir: tempfile::TempDir,
+    port: u16,
+}
+
+async fn spawn_singbox_ss() -> Option<SingBox> {
+    let bin = singbox_binary()?;
+    let port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("sing-box.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"{{"log":{{"level":"error"}},
+"inbounds":[{{"type":"shadowsocks","tag":"ss-in","listen":"127.0.0.1",
+"listen_port":{port},"method":"{SS_CIPHER}","password":"{SS_PASSWORD}"}}],
+"outbounds":[{{"type":"direct","tag":"direct"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let child = Command::new(bin)
+        .arg("run")
+        .arg("-c")
+        .arg(&cfg)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn sing-box");
+    let deadline = Instant::now() + TIMEOUT;
+    while TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+        assert!(Instant::now() < deadline, "sing-box never listened");
+        sleep(Duration::from_millis(50)).await;
+    }
+    Some(SingBox {
+        _child: child,
+        _dir: dir,
+        port,
+    })
+}
+
+/// Official shadow-tls v3 relay in front of an arbitrary data backend.
+async fn spawn_relay_to(backend: SocketAddr) -> Option<Relay> {
+    let bin = server_binary()?;
+    let (cover_addr, cover_pin) = spawn_cover(CoverTls::V13).await;
+    let port = free_port();
+    let child = Command::new(bin)
+        .args(["--v3", "--threads", "1", "server"])
+        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .args(["--server", &backend.to_string()])
+        .args(["--tls", &cover_addr.to_string()])
+        .args(["--password", STLS_PASSWORD])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn shadow-tls server");
+    let deadline = Instant::now() + TIMEOUT;
+    while TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "shadow-tls server never listened"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+    Some(Relay {
+        _child: child,
+        port,
+        cover_pin,
+    })
+}
+
+/// UDP echo on loopback; returns its address.
+async fn spawn_udp_echo() -> SocketAddr {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            let _ = sock.send_to(&buf[..n], peer).await;
+        }
+    });
+    addr
+}
+
+fn udp_metadata(dst: SocketAddr) -> Metadata {
+    Metadata {
+        network: Network::Udp,
+        dst_ip: Some(dst.ip()),
+        dst_port: dst.port(),
+        ..Default::default()
+    }
+}
+
+/// Each datagram comes back whole, in order, from the echo's address —
+/// sizes span the 1-byte floor, a typical MTU payload, and datagrams
+/// larger than one 16 KiB TLS record (so a single datagram spans several
+/// ShadowTLS records).  The ceiling is the *server's*: sing-box reads each
+/// UoT datagram into a 16 KiB packet buffer and drops the stream on a
+/// bigger one ("UoT read: short buffer"), though the framing allows 64 KiB.
+async fn uot_echo_round_trips(adapter: &ShadowsocksAdapter, echo: SocketAddr) {
+    assert!(
+        adapter.support_udp(),
+        "udp-over-tcp node must advertise UDP"
+    );
+    let conn = timeout(TIMEOUT, adapter.dial_udp(&udp_metadata(echo)))
+        .await
+        .expect("dial_udp timed out")
+        .expect("dial_udp over udp-over-tcp failed");
+    let mut buf = vec![0u8; 65535];
+    for (i, size) in [1usize, 1200, 9_000, 16_000].into_iter().enumerate() {
+        let payload: Vec<u8> = (0..size).map(|b| (b * 7 + i) as u8).collect();
+        conn.write_packet(&payload, &echo).await.unwrap();
+        let (n, from) = timeout(TIMEOUT, conn.read_packet(&mut buf))
+            .await
+            .expect("uot echo timed out")
+            .expect("uot read");
+        assert_eq!(from, echo, "reply source must be the echo server");
+        assert_eq!(n, size, "datagram {i} boundary");
+        assert!(buf[..n] == payload[..], "datagram {i} corrupted");
+    }
+    // Several datagrams in flight before reading: boundaries survive
+    // coalescing inside the TCP stream.
+    for i in 0..8u8 {
+        conn.write_packet(&[i; 300], &echo).await.unwrap();
+    }
+    for i in 0..8u8 {
+        let (n, _) = timeout(TIMEOUT, conn.read_packet(&mut buf))
+            .await
+            .expect("burst echo timed out")
+            .expect("burst read");
+        assert_eq!(&buf[..n], &[i; 300], "burst datagram {i}");
+    }
+    conn.close().unwrap();
+}
+
+fn uot_adapter(port: u16, version: meow_proxy::UotVersion) -> ShadowsocksAdapter {
+    ShadowsocksAdapter::new(
+        "ss-shadowtls-uot",
+        "127.0.0.1",
+        port,
+        SS_PASSWORD,
+        SS_CIPHER,
+        true,
+        Some("shadow-tls"),
+        Some(&base_opts(STLS_PASSWORD)),
+        Some("chrome"),
+        Arc::new(DirectDialer),
+    )
+    .expect("adapter")
+    .with_udp_over_tcp(version)
+    .expect("udp-over-tcp")
+}
+
+#[tokio::test]
+async fn v3_uot_legacy_over_shadow_tls() {
+    let Some(sb) = spawn_singbox_ss().await else {
+        return;
+    };
+    let Some(relay) = spawn_relay_to(SocketAddr::from(([127, 0, 0, 1], sb.port))).await else {
+        return;
+    };
+    let echo = spawn_udp_echo().await;
+    uot_echo_round_trips(
+        &uot_adapter(relay.port, meow_proxy::UotVersion::Legacy),
+        echo,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn v3_uot_v2_over_shadow_tls() {
+    let Some(sb) = spawn_singbox_ss().await else {
+        return;
+    };
+    let Some(relay) = spawn_relay_to(SocketAddr::from(([127, 0, 0, 1], sb.port))).await else {
+        return;
+    };
+    let echo = spawn_udp_echo().await;
+    uot_echo_round_trips(&uot_adapter(relay.port, meow_proxy::UotVersion::V2), echo).await;
+}
+
+/// Concurrent associations each get their own UoT stream (and their own
+/// ShadowTLS session); TCP keeps working on the same node meanwhile.
+#[tokio::test]
+async fn v3_uot_concurrent_associations_and_tcp() {
+    let Some(sb) = spawn_singbox_ss().await else {
+        return;
+    };
+    let Some(relay) = spawn_relay_to(SocketAddr::from(([127, 0, 0, 1], sb.port))).await else {
+        return;
+    };
+    let echo = spawn_udp_echo().await;
+    let adapter = Arc::new(uot_adapter(relay.port, meow_proxy::UotVersion::V2));
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let adapter = Arc::clone(&adapter);
+        tasks.push(tokio::spawn(async move {
+            uot_echo_round_trips(&adapter, echo).await;
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+}
+
+/// Without `udp-over-tcp` the same node refuses UDP outright — ShadowTLS
+/// has no datagram path and meow never sends raw SS UDP beside it.
+#[tokio::test]
+async fn v3_without_uot_refuses_udp() {
+    if server_binary().is_none() {
+        return;
+    }
+    let adapter = adapter(free_port(), &base_opts(STLS_PASSWORD));
+    assert!(!adapter.support_udp());
+    let err = adapter
+        .dial_udp(&udp_metadata("127.0.0.1:53".parse().unwrap()))
+        .await
+        .err()
+        .expect("plain UDP must be refused");
+    assert!(err.to_string().contains("shadow-tls"), "{err}");
+}

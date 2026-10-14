@@ -32,21 +32,30 @@ pub mod gost_plugin;
 pub mod jls_plugin;
 #[cfg(feature = "kcptun")]
 pub mod kcptun_plugin;
-#[cfg(feature = "ss")]
+#[cfg(feature = "shadow-tls")]
+#[cfg_attr(
+    not(feature = "ss"),
+    allow(
+        dead_code,
+        reason = "snell-only builds use just the shadow-tls opts helpers"
+    )
+)]
 mod plugin_util;
 #[cfg(feature = "ss")]
 pub mod restls_plugin;
-#[cfg(feature = "ss")]
+#[cfg(feature = "shadow-tls")]
 pub mod shadow_tls_plugin;
 #[cfg(feature = "ss")]
 pub mod shadowsocks_adapter;
 #[cfg(feature = "ss")]
 pub mod v2ray_plugin;
 
-/// `uot.AddrParser` per-packet address headers — shared by the anytls and
-/// kcptun UDP-over-TCP relays.
-#[cfg(any(feature = "anytls", feature = "kcptun"))]
+/// UDP-over-TCP framing — shared by the Shadowsocks `udp-over-tcp` option,
+/// kcptun's forced legacy relay and the anytls uot reader.
+#[cfg(any(feature = "anytls", feature = "ss"))]
 mod uot;
+#[cfg(feature = "ss")]
+pub use uot::UotVersion;
 
 #[cfg(feature = "trojan")]
 pub mod trojan;
@@ -117,7 +126,7 @@ pub use vmess::VmessAdapter;
     feature = "trojan",
     feature = "vless",
     feature = "anytls",
-    feature = "kcptun",
+    feature = "ss",
     feature = "snell"
 ))]
 pub(crate) struct PoisonOnIncomplete<'a> {
@@ -129,7 +138,7 @@ pub(crate) struct PoisonOnIncomplete<'a> {
     feature = "trojan",
     feature = "vless",
     feature = "anytls",
-    feature = "kcptun",
+    feature = "ss",
     feature = "snell"
 ))]
 impl<'a> PoisonOnIncomplete<'a> {
@@ -145,7 +154,7 @@ impl<'a> PoisonOnIncomplete<'a> {
     feature = "trojan",
     feature = "vless",
     feature = "anytls",
-    feature = "kcptun",
+    feature = "ss",
     feature = "snell"
 ))]
 impl Drop for PoisonOnIncomplete<'_> {
@@ -166,7 +175,7 @@ impl Drop for PoisonOnIncomplete<'_> {
     feature = "trojan",
     feature = "vless",
     feature = "anytls",
-    feature = "kcptun",
+    feature = "ss",
     feature = "snell"
 ))]
 pub(crate) fn check_not_desynced(

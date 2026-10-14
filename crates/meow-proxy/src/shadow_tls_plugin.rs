@@ -1,14 +1,18 @@
-//! In-process `shadow-tls` SIP003 plugin for Shadowsocks (mihomo
-//! `transport/sing-shadowtls` parity — the record layer lives in
-//! [`meow_transport::shadow_tls`]).
+//! In-process ShadowTLS client options + dial (mihomo `transport/shadowtls`
+//! parity — the record layer lives in [`meow_transport::shadow_tls`]).
 //!
-//! `plugin: shadow-tls` with `plugin-opts` keys:
+//! Shared by the Shadowsocks `plugin: shadow-tls` SIP003 plugin and Snell's
+//! `obfs-opts.mode: shadow-tls` (both mihomo surfaces decode the same
+//! `shadowTLSOption`), so the option parser, the cover-handshake shaping and
+//! the handshake itself exist exactly once.
+//!
+//! Option keys (`plugin-opts` for SS, `obfs-opts` for Snell):
 //!
 //! | opt | meaning | default |
 //! |-----|---------|---------|
 //! | `host` | cover server name — TLS SNI of the relayed handshake | *(required)* |
 //! | `password` | per-user PSK (v2 handshake HMAC / v3 session-id tag) | `""` |
-//! | `version` | protocol version 1, 2 or 3 | *(required)* |
+//! | `version` | protocol version 1, 2 or 3 | `2` (upstream default) |
 //! | `alpn` | comma-separated ALPN list for the cover handshake | `h2,http/1.1` |
 //! | `skip-cert-verify` | disable cover cert verification | `false` |
 //! | `name-cert-verify` | cert-verify hostname when it differs from SNI — meow extension, upstream ignores this key | `host` |
@@ -40,16 +44,23 @@ use crate::transport_to_proxy_err;
 
 const PLUGIN: &str = "shadow-tls";
 
+/// Protocol version used when `plugin-opts.version` is omitted — mihomo
+/// pre-seeds its option struct with `Version: 2` before decoding.
+pub const DEFAULT_VERSION: u8 = 2;
+
 /// Parsed `shadow-tls` client options.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written so the PSK and client key never reach a log
+/// line or error message.
+#[derive(Clone)]
 pub struct ShadowTlsConfig {
     /// Cover server name — the TLS handshake's SNI; the shadow-tls server
     /// relays the handshake to this host.
     pub host: String,
     /// Per-user PSK (ignored by v1, matching upstream).
     pub password: String,
-    /// Protocol version 1, 2 or 3 — required; upstream `obfs:"version"`
-    /// has no default (absent → 0 → `NewClient` errors).
+    /// Protocol version 1, 2 or 3 — defaults to [`DEFAULT_VERSION`] when
+    /// omitted, like upstream (`shadowTLSOption{Version: 2}` before decode).
     pub version: u8,
     /// ALPN for the cover handshake (upstream default `h2,http/1.1`).
     pub alpn: Vec<String>,
@@ -69,17 +80,35 @@ pub struct ShadowTlsConfig {
     pub strict_mode: bool,
 }
 
+impl std::fmt::Debug for ShadowTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShadowTlsConfig")
+            .field("host", &self.host)
+            .field("password", &"<redacted>")
+            .field("version", &self.version)
+            .field("alpn", &self.alpn)
+            .field("skip_cert_verify", &self.skip_cert_verify)
+            .field("verify_name", &self.verify_name)
+            .field("cert_pin", &self.cert_pin.is_some())
+            .field("client_cert", &self.client_cert.is_some())
+            .field("strict_mode", &self.strict_mode)
+            .finish()
+    }
+}
+
 /// Parse a flattened SIP003 opts string for `shadow-tls`
 /// (`host=cover.example.com;password=…;version=3;alpn=h2,http/1.1`).
 ///
 /// - `host` is required (upstream `obfs:"host"` has no `omitempty`).
-/// - `version` accepts `1`/`2`/`3`; anything else is a config error.
+/// - `version` accepts `1`/`2`/`3` and defaults to [`DEFAULT_VERSION`]
+///   when omitted; anything else (incl. an explicit empty value) is a
+///   config error.
 /// - Unknown keys are logged at `warn` level and ignored.
 pub fn parse_opts(s: &str) -> Result<ShadowTlsConfig> {
     let mut cfg = ShadowTlsConfig {
         host: String::new(),
         password: String::new(),
-        version: 0,
+        version: DEFAULT_VERSION,
         alpn: Vec::new(),
         skip_cert_verify: false,
         verify_name: None,
@@ -87,7 +116,6 @@ pub fn parse_opts(s: &str) -> Result<ShadowTlsConfig> {
         client_cert: None,
         strict_mode: false,
     };
-    let mut version_seen = false;
     let mut alpn_seen = false;
     let mut cert_pem: Option<Vec<u8>> = None;
     let mut key_pem: Option<Vec<u8>> = None;
@@ -97,7 +125,6 @@ pub fn parse_opts(s: &str) -> Result<ShadowTlsConfig> {
             "host" => cfg.host = value,
             "password" => cfg.password = value,
             "version" => {
-                version_seen = true;
                 cfg.version = value
                     .parse::<u8>()
                     .ok()
@@ -138,14 +165,6 @@ pub fn parse_opts(s: &str) -> Result<ShadowTlsConfig> {
     if cfg.host.is_empty() {
         return Err(MeowError::Config(format!(
             "{PLUGIN}: missing required 'host' opt (cover server name)"
-        )));
-    }
-    // Upstream has no version default — absent maps to 0 and NewClient
-    // rejects it.  Fail loud the same way rather than silently picking
-    // a wire protocol the operator did not ask for.
-    if !version_seen {
-        return Err(MeowError::Config(format!(
-            "{PLUGIN}: missing required 'version' opt (1, 2 or 3)"
         )));
     }
     // Absent `alpn` → upstream DefaultALPN; `alpn=` (explicit empty) is
@@ -237,8 +256,30 @@ fn tls_config_for(cfg: &ShadowTlsConfig, client_fingerprint: Option<&str>) -> Tl
     }
 }
 
+/// Run the ShadowTLS handshake over an already-connected stream (a fresh
+/// TCP dial, or a relay-supplied stream on a `relay` chain hop) and return
+/// the authenticated data stream ready for the SS/Snell codec.
+///
+/// Fails closed: an unauthenticated relay, a strict-mode violation or a
+/// cover-certificate failure is an error — never a fallback to plain data.
+pub async fn handshake_over(
+    cfg: &ShadowTlsConfig,
+    tls: &TlsLayer,
+    stream: Box<dyn Stream>,
+) -> Result<Box<dyn Stream>> {
+    shadow_tls::dial(
+        stream,
+        tls,
+        cfg.version,
+        cfg.password.as_bytes(),
+        cfg.strict_mode,
+    )
+    .await
+    .map_err(transport_to_proxy_err)
+}
+
 /// Dial a TCP + shadow-tls connection to `server_host:server_port` and
-/// return the framed stream ready to be wrapped by the SS layer.
+/// return the framed stream ready to be wrapped by the SS/Snell codec.
 pub async fn dial(
     cfg: &ShadowTlsConfig,
     tls: &TlsLayer,
@@ -255,15 +296,7 @@ pub async fn dial(
         .dial(server_host, server_port, internal)
         .await
         .map_err(MeowError::Io)?;
-    shadow_tls::dial(
-        Box::new(tcp),
-        tls,
-        cfg.version,
-        cfg.password.as_bytes(),
-        cfg.strict_mode,
-    )
-    .await
-    .map_err(transport_to_proxy_err)
+    handshake_over(cfg, tls, Box::new(tcp)).await
 }
 
 #[cfg(test)]
@@ -273,8 +306,10 @@ mod tests {
     #[test]
     fn parse_opts_cases() {
         let cases: &[(&str, bool)] = &[
-            ("host=cover.example.com", false), // version required (upstream parity)
-            ("host=cover.example.com;password=psk", false), // ditto
+            // version omitted → upstream default 2
+            ("host=cover.example.com", true),
+            ("host=cover.example.com;password=psk", true),
+            ("host=h;version=", false), // explicit empty is not "omitted"
             // every version accepted
             ("host=h;version=1;password=p", true),
             ("host=h;version=2;password=p", true),
@@ -346,6 +381,38 @@ mod tests {
         let tls = tls_config_for(&cfg, Some("randomized"));
         assert_eq!(tls.curves.as_deref(), Some("X25519:P-256:P-384"));
         assert_eq!(tls.fingerprint.as_deref(), Some("randomized"));
+    }
+
+    /// mihomo seeds `Version: 2` before decoding `plugin-opts`, so an
+    /// omitted `version` is v2; explicit values are kept verbatim and
+    /// anything outside 1..=3 is refused with the offending value named.
+    #[test]
+    fn version_defaults_to_two_and_validates() {
+        let cfg = parse_opts("host=cover.example.com;password=p").unwrap();
+        assert_eq!(cfg.version, DEFAULT_VERSION);
+        assert_eq!(cfg.version, 2);
+        for v in 1..=3u8 {
+            let cfg = parse_opts(&format!("host=h;password=p;version={v}")).unwrap();
+            assert_eq!(cfg.version, v, "explicit version {v} kept");
+        }
+        for bad in ["0", "4", "-1", "three", ""] {
+            let err = parse_opts(&format!("host=h;password=p;version={bad}"))
+                .expect_err("invalid version must fail")
+                .to_string();
+            assert!(
+                err.contains("'version' must be 1, 2 or 3") && err.contains(bad),
+                "version={bad:?}: {err}"
+            );
+        }
+    }
+
+    /// Neither the PSK nor key material may leak through `Debug`.
+    #[test]
+    fn debug_redacts_password() {
+        let cfg = parse_opts("host=h;password=hunter2-secret;version=3").unwrap();
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("hunter2-secret"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
     }
 
     #[test]

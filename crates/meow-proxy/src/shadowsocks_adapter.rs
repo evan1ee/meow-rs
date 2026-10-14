@@ -133,6 +133,9 @@ pub struct ShadowsocksAdapter {
     core: Arc<SsCore>,
     addr_str: SmolStr,
     support_udp: bool,
+    /// `udp-over-tcp`: carry UDP inside an SS TCP stream (through the
+    /// node's plugin transport — ShadowTLS included) instead of SS UDP.
+    uot: Option<crate::uot::UotVersion>,
     health: ProxyHealth,
     /// sing-mux compatible connection multiplexing (optional).
     #[cfg(feature = "mux")]
@@ -297,10 +300,37 @@ impl ShadowsocksAdapter {
             core,
             addr_str,
             support_udp: udp,
+            uot: None,
             health: ProxyHealth::new(),
             #[cfg(feature = "mux")]
             mux: None,
         })
+    }
+
+    /// Enable `udp-over-tcp` (mihomo `UDPOverTCP`): every UDP association
+    /// opens an SS TCP stream to the UoT magic destination — dialed through
+    /// the node's plugin transport exactly like TCP traffic, so with
+    /// `plugin: shadow-tls` the datagrams ride the authenticated ShadowTLS
+    /// records and never leave as SS UDP.  The server must speak UoT
+    /// (sing-box / mihomo SS inbounds do; plain ss-server does not).
+    ///
+    /// # Errors
+    ///
+    /// `MeowError::Config` for v2 on a kcptun node — kcptun already carries
+    /// UDP over the legacy UoT relay its server expects.
+    pub fn with_udp_over_tcp(mut self, version: crate::uot::UotVersion) -> Result<Self> {
+        #[cfg(feature = "kcptun")]
+        if matches!(self.core.plugin, PluginKind::Kcptun(_))
+            && version != crate::uot::UotVersion::Legacy
+        {
+            return Err(MeowError::Config(format!(
+                "ss[{}]: kcptun carries UDP over legacy udp-over-tcp only; \
+                 remove udp-over-tcp-version or set it to 1",
+                self.name
+            )));
+        }
+        self.uot = Some(version);
+        Ok(self)
     }
 
     /// Enable sing-mux compatible connection multiplexing.  The session's
@@ -627,16 +657,11 @@ impl SsCore {
                         .into(),
                 ))
             }
-            PluginKind::ShadowTls(..) => {
-                // shadow-tls could terminate on a relay-supplied stream once
-                // it grows a `handshake_over` split — its `dial` currently
-                // owns the TCP dial itself. Until then, fail loudly rather
-                // than send unwrapped traffic.
-                Err(MeowError::NotSupported(
-                    "ss: shadow-tls transport does not yet support \
-                     terminating on a relay-supplied stream"
-                        .into(),
-                ))
+            PluginKind::ShadowTls(cfg, tls) => {
+                // The cover handshake runs over the relay-supplied stream
+                // exactly as over a fresh TCP dial (same helper as Snell).
+                let transport = shadow_tls_plugin::handshake_over(cfg, tls, stream).await?;
+                Ok(self.ss_conn(transport, addr))
             }
             PluginKind::Restls(..) => {
                 // restls could terminate on a relay-supplied stream once it
@@ -1430,7 +1455,10 @@ impl ProxyAdapter for ShadowsocksAdapter {
             && self.core.dialer.supports_udp();
         #[cfg(not(feature = "kcptun"))]
         let kcptun_udp_ok = false;
-        plain_udp_ok || kcptun_udp_ok || {
+        // UoT needs nothing from a front but TCP — it rides the same
+        // dialer as the node's TCP traffic.
+        let uot_udp_ok = self.support_udp && self.uot.is_some();
+        plain_udp_ok || kcptun_udp_ok || uot_udp_ok || {
             #[cfg(feature = "mux")]
             {
                 self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
@@ -1521,8 +1549,8 @@ impl ProxyAdapter for ShadowsocksAdapter {
             );
             let stream = client.open_stream().await?;
             let target = Address::DomainNameAddress(
-                kcptun_plugin::UOT_MAGIC_HOST.to_string(),
-                kcptun_plugin::UOT_MAGIC_PORT,
+                crate::uot::UOT_LEGACY_MAGIC_HOST.to_string(),
+                crate::uot::UOT_MAGIC_PORT,
             );
             let ss_stream = ProxyClientStream::from_stream(
                 Arc::clone(&self.core.context),
@@ -1530,9 +1558,44 @@ impl ProxyAdapter for ShadowsocksAdapter {
                 &self.core.server_config,
                 target,
             );
-            return Ok(Box::new(kcptun_plugin::UotPacketConn::new(Box::new(
+            return Ok(Box::new(crate::uot::UotPacketConn::new(Box::new(
                 ss_stream,
             ))));
+        }
+
+        // `udp-over-tcp`: the association is one SS TCP stream to the UoT
+        // magic destination, opened through `dial_tcp_stream` — the same
+        // plugin transport (ShadowTLS, obfs, v2ray, …) and the same dialer
+        // (`dialer-proxy` included) as TCP traffic.  Checked before the
+        // plugin UDP refusal below because it never touches SS UDP.
+        if let Some(version) = self.uot {
+            let write_target = match metadata.domain_udp_target() {
+                Some((host, port)) if host.len() <= u8::MAX as usize => Some((host.clone(), port)),
+                Some((host, _)) => {
+                    return Err(MeowError::NotSupported(format!(
+                        "ss uot: domain UDP target exceeds 255 bytes ({}B)",
+                        host.len()
+                    )));
+                }
+                None => None,
+            };
+            debug!(
+                "SS UDP over udp-over-tcp {version:?} to {} via {}",
+                metadata.remote_address(),
+                self.addr_str
+            );
+            let target = Address::DomainNameAddress(
+                version.magic_host().to_string(),
+                crate::uot::UOT_MAGIC_PORT,
+            );
+            let stream = self
+                .core
+                .dial_tcp_stream(target, metadata.is_internal())
+                .await?;
+            let conn =
+                crate::uot::UotPacketConn::open(Box::new(stream), version, metadata, write_target)
+                    .await?;
+            return Ok(Box::new(conn));
         }
 
         // TCP-transport plugins (v2ray/gost/shadow-tls/…) refuse UDP
@@ -2516,12 +2579,14 @@ mod tests {
         }
     }
 
-    /// A relay-supplied stream already terminates at the real SS server —
-    /// a built-in transport that owns its TCP dial (shadow-tls) must fail
-    /// loudly on `connect_over` rather than send unwrapped SS traffic
-    /// through the front hop.
+    /// A relay-supplied stream (`relay` chain hop) runs the ShadowTLS cover
+    /// handshake exactly like a fresh dial: the first bytes on the wire are
+    /// a TLS ClientHello — never plain SS — and a peer that is not a
+    /// ShadowTLS relay fails the dial instead of degrading to unwrapped
+    /// traffic.
     #[tokio::test]
-    async fn shadow_tls_refuses_relay_supplied_stream() {
+    async fn shadow_tls_handshakes_over_relay_supplied_stream() {
+        use tokio::io::AsyncReadExt;
         let adapter = ShadowsocksAdapter::new(
             "ss-test",
             "127.0.0.1",
@@ -2530,22 +2595,30 @@ mod tests {
             "aes-256-gcm",
             true,
             Some("shadow-tls"),
-            Some("host=cover.example.com;password=p;version=2"),
+            Some("host=cover.example.com;password=p;version=3"),
             None,
             Arc::new(crate::dialer::DirectDialer),
         )
         .expect("shadow-tls adapter builds");
-        let (stream, _peer) = tokio::io::duplex(64);
+        let (stream, mut peer) = tokio::io::duplex(4096);
+        let peer_task = tokio::spawn(async move {
+            let mut hdr = [0u8; 6];
+            peer.read_exact(&mut hdr).await.unwrap();
+            hdr // dropping `peer` here hangs up mid-handshake
+        });
         let stream = crate::stream_conn::StreamConn(Box::new(stream));
-        match adapter
+        let res = adapter
             .connect_over(Box::new(stream), &Metadata::default())
-            .await
-        {
-            Err(MeowError::NotSupported(m)) => {
-                assert!(m.contains("shadow-tls"), "refusal names itself: {m}");
-            }
-            Err(e) => panic!("expected NotSupported, got: {e}"),
-            Ok(_) => panic!("shadow-tls must refuse a relay-supplied stream"),
+            .await;
+        let hdr = peer_task.await.unwrap();
+        assert_eq!(hdr[0], 0x16, "first record must be a TLS handshake");
+        assert_eq!(hdr[5], 0x01, "…carrying a ClientHello");
+        match res {
+            Err(e) => assert!(
+                !matches!(e, MeowError::NotSupported(_)),
+                "relay hops are supported now; got {e}"
+            ),
+            Ok(_) => panic!("a hung-up peer must fail the shadow-tls handshake"),
         }
     }
 

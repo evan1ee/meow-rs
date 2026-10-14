@@ -33,7 +33,7 @@ use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
 
-use crate::uot::{encode_uot_addr, encode_uot_addr_domain, read_uot_addr};
+use crate::uot::{encode_uot_addr, encode_uot_addr_domain, encode_uot_request, read_uot_addr};
 
 /// AnyTLS outbound adapter.
 pub struct AnytlsAdapter {
@@ -428,59 +428,11 @@ impl ProxyConn for AnytlsConn {}
 // upstream: sing `common/uot/{protocol,conn,server}.go`,
 // mihomo `adapter/outbound/anytls.go: ListenPacketContext`
 
-/// SOCKS5 address-family bytes — the **request** header only.
-const SOCKS5_ATYP_IPV4: u8 = 0x01;
-const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
-const SOCKS5_ATYP_IPV6: u8 = 0x04;
-
 /// One anytls data frame carries a `u16` length, so a datagram plus its uot
 /// header must fit in 64 KiB. The largest possible IPv6 header is
 /// ATYP(1) + addr(16) + port(2) + length(2) = 21 bytes, which still leaves
 /// room for a maximum-size (65507-byte) UDP payload.
 const MAX_UOT_FRAME: usize = u16::MAX as usize;
-
-/// Encode the one-shot uot request: `isConnect = 0` followed by the session's
-/// nominal destination in SOCKS5 form. In non-connect mode the server ignores
-/// this address (it routes per packet), but upstream still sends it and its
-/// serializer rejects an empty address, so mirror mihomo and send the
-/// resolved destination — falling back to the hostname when the metadata has
-/// no IP yet.
-fn encode_uot_request(metadata: &Metadata) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(24);
-    buf.push(0); // isConnect = false
-    match metadata.dst_ip {
-        Some(IpAddr::V4(v4)) => {
-            buf.push(SOCKS5_ATYP_IPV4);
-            buf.extend_from_slice(&v4.octets());
-        }
-        Some(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
-            Some(v4) => {
-                buf.push(SOCKS5_ATYP_IPV4);
-                buf.extend_from_slice(&v4.octets());
-            }
-            None => {
-                buf.push(SOCKS5_ATYP_IPV6);
-                buf.extend_from_slice(&v6.octets());
-            }
-        },
-        None => {
-            // No resolved IP: send the hostname, truncated to the 255-byte
-            // ceiling the length prefix allows. An empty host degrades to
-            // 0.0.0.0 rather than an unencodable address.
-            let host = metadata.host.as_bytes();
-            if host.is_empty() || host.len() > 255 {
-                buf.push(SOCKS5_ATYP_IPV4);
-                buf.extend_from_slice(&Ipv4Addr::UNSPECIFIED.octets());
-            } else {
-                buf.push(SOCKS5_ATYP_DOMAIN);
-                buf.push(host.len() as u8);
-                buf.extend_from_slice(host);
-            }
-        }
-    }
-    buf.extend_from_slice(&metadata.dst_port.to_be_bytes());
-    buf
-}
 
 /// UDP-over-AnyTLS packet connection.
 ///
@@ -728,7 +680,7 @@ fn install_anytls_bridges() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uot::UOT_ATYP_IPV4;
+    use crate::uot::{SOCKS5_ATYP_DOMAIN, SOCKS5_ATYP_IPV4, SOCKS5_ATYP_IPV6, UOT_ATYP_IPV4};
     use anytls_rs::protocol::Command;
     use meow_common::Network;
     use std::time::Duration;

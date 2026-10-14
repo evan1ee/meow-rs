@@ -177,6 +177,95 @@ pub fn parse_proxy_provider_node(
     parse_proxy_with_dialer(config, dialer, ipv6)
 }
 
+/// SS `udp-over-tcp` / `udp-over-tcp-version` (mihomo `ShadowSocksOption`).
+///
+/// Returns the UoT version to enable, or `None` when UoT is off.  The
+/// version is validated even when UoT is off, like upstream (`0`/absent →
+/// legacy, `1`, `2`; anything else errors).  kcptun forces UoT upstream; a
+/// kcptun node asking for v2 is surfaced so the adapter can refuse it.
+#[cfg(feature = "ss")]
+fn parse_ss_udp_over_tcp(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+    plugin: Option<&str>,
+) -> std::result::Result<Option<meow_proxy::UotVersion>, String> {
+    let enabled = match config.get("udp-over-tcp") {
+        None | Some(serde_yaml::Value::Null) => false,
+        Some(serde_yaml::Value::Bool(b)) => *b,
+        Some(other) => {
+            return Err(format!(
+                "ss[{name}]: udp-over-tcp must be a boolean, got {other:?}"
+            ));
+        }
+    };
+    let raw = match config.get("udp-over-tcp-version") {
+        None | Some(serde_yaml::Value::Null) => 0,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| format!("ss[{name}]: udp-over-tcp-version must be 1 or 2, got {v:?}"))?,
+    };
+    let version = meow_proxy::UotVersion::from_config(raw).ok_or_else(|| {
+        format!("ss[{name}]: unknown udp-over-tcp-version {raw}; expected 1 or 2")
+    })?;
+    let kcptun_v2 = plugin == Some("kcptun") && version != meow_proxy::UotVersion::Legacy;
+    Ok((enabled || kcptun_v2).then_some(version))
+}
+
+/// Node-level mihomo options that select a security or transport mode
+/// meow does not implement for the node's `type` — rejected before any
+/// adapter is built, so a config that relies on them fails at load
+/// instead of dialing without the protection it asked for (Class A per
+/// ADR-0002).
+///
+/// - `shadow-tls-opts` / `restls-opts` / `jls-opts` are mihomo's
+///   trojan/vless/vmess "security modes" that replace the node's TLS.
+///   Ignoring them would run plain TLS against a ShadowTLS relay, which
+///   forwards it to the real cover site — trojan's password hash included.
+///   meow offers ShadowTLS for `type: ss` (`plugin: shadow-tls`) and
+///   `type: snell` (`obfs-opts.mode: shadow-tls`), restls/jls for SS only.
+/// - `udp-over-tcp` is a Shadowsocks option; any other type silently
+///   dropping it would change how (and whether) UDP leaves the host.
+fn reject_unsupported_transport_opts(
+    name: &str,
+    proxy_type: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> std::result::Result<(), String> {
+    let set = |key: &str| {
+        config.get(key).is_some_and(|v| match v {
+            serde_yaml::Value::Null | serde_yaml::Value::Bool(false) => false,
+            serde_yaml::Value::Mapping(map) => !map.is_empty(),
+            serde_yaml::Value::String(text) => !text.is_empty(),
+            _ => true,
+        })
+    };
+    for (key, supported) in [
+        (
+            "shadow-tls-opts",
+            "ShadowTLS only for `type: ss` (`plugin: shadow-tls`) and \
+             `type: snell` (`obfs-opts.mode: shadow-tls`)",
+        ),
+        (
+            "restls-opts",
+            "restls only for `type: ss` (`plugin: restls`)",
+        ),
+        ("jls-opts", "jls only for `type: ss` (`plugin: jls`)"),
+    ] {
+        if set(key) {
+            return Err(format!(
+                "{proxy_type}[{name}]: `{key}` is not supported — meow implements \
+                 {supported}; remove `{key}` rather than dial without it"
+            ));
+        }
+    }
+    if proxy_type != "ss" && set("udp-over-tcp") {
+        return Err(format!(
+            "{proxy_type}[{name}]: `udp-over-tcp` is a Shadowsocks option and is \
+             not supported on `type: {proxy_type}`"
+        ));
+    }
+    Ok(())
+}
+
 /// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
 /// into every adapter. Used by apply_dialer_proxies — and by provider node
 /// parsing (issue #489) — to inject a [meow_proxy::dialer::NamedProxyDialer]
@@ -195,6 +284,8 @@ pub fn parse_proxy_with_dialer(
         .get("type")
         .and_then(|v| v.as_str())
         .ok_or("missing proxy type")?;
+
+    reject_unsupported_transport_opts(name, proxy_type, config)?;
 
     match proxy_type {
         #[cfg(feature = "trusttunnel")]
@@ -250,7 +341,6 @@ pub fn parse_proxy_with_dialer(
                 plugin
             };
 
-            #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
             let mut adapter = ShadowsocksAdapter::new(
                 name,
                 server,
@@ -264,6 +354,17 @@ pub fn parse_proxy_with_dialer(
                 Arc::clone(dialer),
             )
             .map_err(|e| format!("ss: {e}"))?;
+            if let Some(version) = parse_ss_udp_over_tcp(name, config, plugin)? {
+                if !udp {
+                    tracing::warn!(
+                        proxy = %name,
+                        "udp-over-tcp has no effect while `udp` is false"
+                    );
+                }
+                adapter = adapter
+                    .with_udp_over_tcp(version)
+                    .map_err(|e| format!("ss: {e}"))?;
+            }
             #[cfg(feature = "mux")]
             if let Some(mux_options) = parse_mux_options(name, config)? {
                 // muxcool rides VLESS CommandMux; shadowsocks has no
@@ -592,9 +693,41 @@ fn parse_snell(
                     _ => SnellObfs::Tls { server: host },
                 }
             }
+            // mihomo parity: the same option keys as the SS
+            // `plugin: shadow-tls` `plugin-opts` (one `shadowTLSOption`
+            // upstream), so reuse that parser verbatim — `mode` is the
+            // only snell-specific key.
+            "shadow-tls" => {
+                let mut opts = opts.clone();
+                if let Some(map) = opts.as_mapping_mut() {
+                    map.remove("mode");
+                }
+                let flat = serialize_plugin_opts(&opts).unwrap_or_default();
+                let shadow = meow_proxy::shadow_tls_plugin::parse_opts(&flat)
+                    .map_err(|e| format!("snell[{name}]: obfs-opts: {e}"))?;
+                SnellObfs::ShadowTls {
+                    config: Box::new(shadow),
+                    client_fingerprint: config
+                        .get("client-fingerprint")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                }
+            }
+            // mihomo's snell also accepts these cover-TLS modes; meow
+            // implements them for `type: ss` plugins only.  Name the
+            // mode explicitly rather than "invalid" — it is a known,
+            // unsupported transport (Class A per ADR-0002: running
+            // without it would expose plain snell to the cover relay).
+            mode @ ("restls" | "jls") => {
+                return Err(format!(
+                    "snell[{name}]: obfs-opts.mode '{mode}' is not supported — \
+                     meow implements {mode} only as a `type: ss` plugin \
+                     (`plugin: {mode}`); expected one of off, http, tls, shadow-tls"
+                ));
+            }
             other => {
                 return Err(format!(
-                    "snell[{name}]: obfs-opts.mode '{other}' invalid; expected one of off, http, tls"
+                    "snell[{name}]: obfs-opts.mode '{other}' invalid; expected one of off, http, tls, shadow-tls"
                 ));
             }
         }
@@ -2698,7 +2831,7 @@ fn parse_uuid(s: &str) -> std::result::Result<[u8; 16], String> {
 /// tokens (the SIP003 convention shared by `v2ray-plugin` and
 /// `gost-plugin`), and any other map is dotted into its parent key
 /// (`ech-opts: {enable: true}` → `ech-opts.enable=true`).
-#[cfg(feature = "ss")]
+#[cfg(any(feature = "ss", feature = "snell"))]
 fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
     // `;` separates tokens and `=` separates key from value, so neither may
     // appear inside a serialized name or value — otherwise a nested map
@@ -3776,6 +3909,241 @@ tls: true
              password: stls-secret\n  version: 3\n  skip-cert-verify: maybe\n",
         );
         assert!(parse_proxy(&cfg).is_err());
+    }
+
+    #[cfg(feature = "ss")]
+    fn ss_stls_node(opts: &str) -> HashMap<String, serde_yaml::Value> {
+        proxy_config(&format!(
+            "name: n\ntype: ss\nserver: 203.0.113.10\nport: 6443\n\
+             cipher: chacha20-ietf-poly1305\npassword: ss-secret\n\
+             plugin: shadow-tls\nplugin-opts:\n  host: www.example.com\n  \
+             password: stls-secret\n{opts}"
+        ))
+    }
+
+    /// mihomo seeds `Version: 2` before decoding `plugin-opts`: an omitted
+    /// version is v2 (previously a meow config error), explicit 1/2/3 keep
+    /// working as int or string, and anything else fails naming the key.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn test_shadow_tls_version_default_and_values() {
+        parse_proxy(&ss_stls_node("")).expect("omitted version defaults to 2");
+        for v in ["1", "2", "3", "'2'", "'3'"] {
+            parse_proxy(&ss_stls_node(&format!("  version: {v}\n")))
+                .unwrap_or_else(|e| panic!("version {v}: {e}"));
+        }
+        for bad in ["0", "4", "three", "-1", "''"] {
+            let Err(err) = parse_proxy(&ss_stls_node(&format!("  version: {bad}\n"))) else {
+                panic!("version {bad} must be rejected");
+            };
+            assert!(err.contains("'version' must be 1, 2 or 3"), "{bad}: {err}");
+        }
+    }
+
+    /// Security-mode keys meow does not implement for the node's type fail
+    /// at load (before any dial) instead of being silently dropped — a
+    /// trojan node carrying `shadow-tls-opts` would otherwise speak plain
+    /// TLS to a ShadowTLS relay, which forwards it to the real cover.
+    #[test]
+    fn test_reject_unsupported_transport_opts() {
+        let mut nodes: Vec<(&str, String)> = Vec::new();
+        #[cfg(feature = "trojan")]
+        nodes.push((
+            "trojan",
+            "name: t\ntype: trojan\nserver: 1.2.3.4\nport: 443\npassword: p\nsni: h\n".into(),
+        ));
+        #[cfg(feature = "vless")]
+        nodes.push((
+            "vless",
+            "name: v\ntype: vless\nserver: 1.2.3.4\nport: 443\n\
+             uuid: 11111111-2222-3333-4444-555555555555\ntls: true\n"
+                .into(),
+        ));
+        #[cfg(feature = "vmess")]
+        nodes.push((
+            "vmess",
+            "name: m\ntype: vmess\nserver: 1.2.3.4\nport: 443\n\
+             uuid: 11111111-2222-3333-4444-555555555555\nalterId: 0\ncipher: auto\ntls: true\n"
+                .into(),
+        ));
+        #[cfg(feature = "snell")]
+        nodes.push((
+            "snell",
+            "name: s\ntype: snell\nserver: 1.2.3.4\nport: 1\npsk: p\nversion: 4\n".into(),
+        ));
+        nodes.push((
+            "socks5",
+            "name: k\ntype: socks5\nserver: 1.2.3.4\nport: 1080\n".into(),
+        ));
+        for (ty, base) in &nodes {
+            parse_proxy(&proxy_config(base)).unwrap_or_else(|e| panic!("{ty} base: {e}"));
+            for (extra, needle) in [
+                (
+                    "shadow-tls-opts:\n  password: x\n  version: 3\n",
+                    "`shadow-tls-opts` is not supported",
+                ),
+                (
+                    "restls-opts:\n  password: x\n",
+                    "`restls-opts` is not supported",
+                ),
+                ("jls-opts:\n  password: x\n", "`jls-opts` is not supported"),
+                (
+                    "udp-over-tcp: true\n",
+                    "`udp-over-tcp` is a Shadowsocks option",
+                ),
+            ] {
+                let Err(err) = parse_proxy(&proxy_config(&format!("{base}{extra}"))) else {
+                    panic!("{ty} + {extra:?} must be rejected");
+                };
+                assert!(err.contains(needle), "{ty} + {extra:?}: {err}");
+            }
+            // Inert declarations stay accepted (mihomo: an empty
+            // `shadow-tls-opts` / `udp-over-tcp: false` enable nothing).
+            for inert in ["shadow-tls-opts: {}\n", "udp-over-tcp: false\n"] {
+                parse_proxy(&proxy_config(&format!("{base}{inert}")))
+                    .unwrap_or_else(|e| panic!("{ty} + {inert:?}: {e}"));
+            }
+        }
+        // `shadow-tls-opts` is not how SS spells it either.
+        #[cfg(feature = "ss")]
+        {
+            let Err(err) = parse_proxy(&ss_stls_node(
+                "  version: 3\nshadow-tls-opts:\n  password: x\n",
+            )) else {
+                panic!("ss + shadow-tls-opts must be rejected");
+            };
+            assert!(err.contains("plugin: shadow-tls"), "{err}");
+        }
+    }
+
+    /// SS `udp-over-tcp` (mihomo parity): strict boolean, version 0/absent
+    /// → legacy, 1, 2, anything else refused even while UoT is off; a
+    /// UoT node advertises UDP even with a TCP-only plugin (ShadowTLS),
+    /// while the same node without UoT does not.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn test_ss_udp_over_tcp_parse() {
+        let stls = |extra: &str| ss_stls_node(&format!("  version: 3\nudp: true\n{extra}"));
+        let ok =
+            |extra: &str| parse_proxy(&stls(extra)).unwrap_or_else(|e| panic!("{extra:?}: {e}"));
+        assert!(!ok("").support_udp(), "shadow-tls alone carries no UDP");
+        for extra in [
+            "udp-over-tcp: true\n",
+            "udp-over-tcp: true\nudp-over-tcp-version: 1\n",
+            "udp-over-tcp: true\nudp-over-tcp-version: 2\n",
+            "udp-over-tcp: true\nudp-over-tcp-version: 0\n",
+        ] {
+            assert!(ok(extra).support_udp(), "{extra:?} must advertise UDP");
+        }
+        assert!(!ok("udp-over-tcp: false\nudp-over-tcp-version: 2\n").support_udp());
+        for (extra, needle) in [
+            ("udp-over-tcp: yes-please\n", "must be a boolean"),
+            (
+                "udp-over-tcp: true\nudp-over-tcp-version: 3\n",
+                "unknown udp-over-tcp-version 3",
+            ),
+            // Validated even while UoT is off (upstream checks it unconditionally).
+            (
+                "udp-over-tcp-version: 7\n",
+                "unknown udp-over-tcp-version 7",
+            ),
+            (
+                "udp-over-tcp: true\nudp-over-tcp-version: two\n",
+                "must be 1 or 2",
+            ),
+        ] {
+            let Err(err) = parse_proxy(&stls(extra)) else {
+                panic!("{extra:?} must be rejected");
+            };
+            assert!(err.contains(needle), "{extra:?}: {err}");
+        }
+        // `udp: false` keeps UDP off; UoT is then inert (warned, not fatal).
+        let node = ss_stls_node("  version: 3\nudp: false\nudp-over-tcp: true\n");
+        assert!(!parse_proxy(&node).unwrap().support_udp());
+        // Plain SS (no plugin) accepts UoT too.
+        let plain = proxy_config(
+            "name: p\ntype: ss\nserver: 1.2.3.4\nport: 8388\ncipher: aes-256-gcm\n\
+             password: pw\nudp: true\nudp-over-tcp: true\nudp-over-tcp-version: 2\n",
+        );
+        assert!(parse_proxy(&plain).unwrap().support_udp());
+    }
+
+    /// kcptun already relays UDP over legacy UoT; asking for v2 is refused
+    /// rather than silently staying on v1.
+    #[cfg(feature = "kcptun")]
+    #[test]
+    fn test_kcptun_rejects_uot_v2() {
+        let node = |extra: &str| {
+            proxy_config(&format!(
+                "name: k\ntype: ss\nserver: 1.2.3.4\nport: 4000\ncipher: aes-256-gcm\n\
+                 password: pw\nudp: true\nplugin: kcptun\nplugin-opts:\n  key: k\n{extra}"
+            ))
+        };
+        parse_proxy(&node("")).expect("kcptun base");
+        parse_proxy(&node("udp-over-tcp: true\nudp-over-tcp-version: 1\n")).expect("v1 ok");
+        let Err(err) = parse_proxy(&node("udp-over-tcp-version: 2\n")) else {
+            panic!("kcptun + uot v2 must be rejected");
+        };
+        assert!(err.contains("legacy udp-over-tcp only"), "{err}");
+    }
+
+    /// Snell `obfs-opts.mode: shadow-tls` (mihomo parity): same option keys
+    /// as the SS plugin, version defaulting to 2, `client-fingerprint`
+    /// from the node; v6 (no obfs) and the SS-only restls/jls modes fail.
+    #[cfg(feature = "snell")]
+    #[test]
+    fn test_snell_shadow_tls_obfs() {
+        let node = |extra: &str| {
+            proxy_config(&format!(
+                "name: s\ntype: snell\nserver: 203.0.113.10\nport: 6443\npsk: p\n{extra}"
+            ))
+        };
+        for (extra, ok) in [
+            (
+                "version: 4\nobfs-opts:\n  mode: shadow-tls\n  host: www.example.com\n  \
+                 password: x\n  version: 3\n",
+                true,
+            ),
+            // version omitted → 2; mode is case-insensitive like http/tls.
+            (
+                "version: 4\nclient-fingerprint: chrome\nobfs-opts:\n  mode: Shadow-TLS\n  \
+                 host: www.example.com\n  password: x\n",
+                true,
+            ),
+            (
+                "version: 3\nobfs-opts:\n  mode: shadow-tls\n  host: h\n  password: x\n  \
+                 version: 3\n  skip-cert-verify: false\n  alpn: [h2]\n",
+                true,
+            ),
+            // host is the cover SNI — required, never defaulted to server.
+            (
+                "version: 4\nobfs-opts:\n  mode: shadow-tls\n  password: x\n",
+                false,
+            ),
+            (
+                "version: 4\nobfs-opts:\n  mode: shadow-tls\n  host: h\n  version: 5\n",
+                false,
+            ),
+            (
+                "version: 4\nobfs-opts:\n  mode: shadow-tls\n  host: h\n  \
+                 skip-cert-verify: maybe\n",
+                false,
+            ),
+            (
+                "version: 6\nobfs-opts:\n  mode: shadow-tls\n  host: h\n  password: x\n",
+                false,
+            ),
+        ] {
+            assert_eq!(parse_proxy(&node(extra)).is_ok(), ok, "{extra:?}");
+        }
+        for mode in ["restls", "jls"] {
+            let Err(err) = parse_proxy(&node(&format!(
+                "version: 4\nobfs-opts:\n  mode: {mode}\n  host: h\n"
+            ))) else {
+                panic!("snell {mode} must be rejected");
+            };
+            assert!(err.contains("not supported"), "{mode}: {err}");
+        }
     }
 
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →

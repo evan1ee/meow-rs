@@ -1,8 +1,8 @@
 //! Snell outbound adapter — implements `ProxyAdapter` for `type: snell`.
 //!
-//! Wires together the v3/v4/v6 codecs, the optional simple-obfs (http/tls)
-//! layer (v3–v5 only), the snell request/response framing, and the optional
-//! reuse pool (`CommandConnectV2`, v4 and later).
+//! Wires together the v3/v4/v6 codecs, the optional obfs layer (simple-obfs
+//! http/tls or ShadowTLS; v3–v5 only), the snell request/response framing,
+//! and the optional reuse pool (`CommandConnectV2`, v4 and later).
 
 use async_trait::async_trait;
 use meow_common::atomic::Uint;
@@ -19,6 +19,9 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::debug;
 
 use meow_transport::simple_obfs::client::{HttpObfs, TlsObfs};
+use meow_transport::tls::TlsLayer;
+
+use crate::shadow_tls_plugin::{self, ShadowTlsConfig};
 
 use super::pool::{Pool, PoolStream};
 use super::protocol::{connect_request, write_header, write_udp_header, Snell, UDP_REQUEST};
@@ -57,14 +60,40 @@ impl SnellVersion {
 const V6_POOL_MAX_IDLE: usize = 10;
 const V6_POOL_MAX_AGE: Duration = Duration::from_secs(60);
 
-/// Optional simple-obfs wrapping the underlying TCP. Mirrors the SS adapter's
+/// Optional obfs wrapping the underlying TCP. Mirrors the SS adapter's
 /// `BuiltinObfs` enum, but kept private to the snell module so the two
 /// adapters stay independent at the type level.
 #[derive(Debug, Clone)]
 pub enum SnellObfs {
     None,
-    Http { host: String },
-    Tls { server: String },
+    Http {
+        host: String,
+    },
+    Tls {
+        server: String,
+    },
+    /// ShadowTLS (`obfs-opts.mode: shadow-tls`, mihomo parity): a real
+    /// cover-TLS handshake relayed by a ShadowTLS server, then the snell
+    /// stream inside its authenticated records.  Same options and
+    /// transport as the SS `plugin: shadow-tls`
+    /// ([`crate::shadow_tls_plugin`]).
+    ShadowTls {
+        config: Box<ShadowTlsConfig>,
+        /// Node-level `client-fingerprint` (uTLS profile for the cover
+        /// ClientHello).
+        client_fingerprint: Option<String>,
+    },
+}
+
+impl SnellObfs {
+    fn label(&self) -> &'static str {
+        match self {
+            SnellObfs::None => "off",
+            SnellObfs::Http { .. } => "http",
+            SnellObfs::Tls { .. } => "tls",
+            SnellObfs::ShadowTls { .. } => "shadow-tls",
+        }
+    }
 }
 
 pub struct SnellAdapter {
@@ -74,6 +103,8 @@ pub struct SnellAdapter {
     addr_str: String,
     psk: Arc<[u8]>,
     obfs: SnellObfs,
+    /// Cover-handshake TLS layer, built once when `obfs` is ShadowTLS.
+    shadow_tls: Option<Arc<TlsLayer>>,
     support_udp: bool,
     pool: Option<Arc<Pool>>,
     version: SnellVersion,
@@ -127,12 +158,18 @@ impl SnellAdapter {
             version.as_str(),
             effective_reuse,
             udp,
-            match &obfs {
-                SnellObfs::None => "off",
-                SnellObfs::Http { .. } => "http",
-                SnellObfs::Tls { .. } => "tls",
-            }
+            obfs.label()
         );
+        let shadow_tls = match &obfs {
+            SnellObfs::ShadowTls {
+                config,
+                client_fingerprint,
+            } => Some(Arc::new(shadow_tls_plugin::build_tls_layer(
+                config,
+                client_fingerprint.as_deref(),
+            )?)),
+            _ => None,
+        };
         Ok(Self {
             name: name.to_string(),
             server: server.to_string(),
@@ -140,6 +177,7 @@ impl SnellAdapter {
             addr_str: format!("{server}:{port}"),
             psk: psk_bytes,
             obfs,
+            shadow_tls,
             support_udp: udp,
             pool: match (effective_reuse, version) {
                 (false, _) => None,
@@ -173,8 +211,8 @@ impl SnellAdapter {
         Ok(self)
     }
 
-    /// Open a fresh underlying byte stream (TCP, optionally wrapped in obfs)
-    /// and Snell-wrap it. No CONNECT header is sent yet.
+    /// Open a fresh underlying byte stream (TCP, then the obfs layer) and
+    /// Snell-wrap it. No CONNECT header is sent yet.
     async fn dial_fresh(&self) -> Result<PoolStream> {
         let tcp = self
             .dialer
@@ -185,14 +223,20 @@ impl SnellAdapter {
             .dial(&self.server, self.port, false)
             .await
             .map_err(MeowError::Io)?;
-        let inner: Box<dyn TransportStream> = Box::new(tcp);
-        self.wrap_stream(inner)
+        let inner = self.apply_obfs(Box::new(tcp)).await?;
+        Ok(self.wrap_codec(inner))
     }
 
-    /// Apply Snell's optional simple-obfs layer and AEAD codec to any already
-    /// connected byte stream.
-    fn wrap_stream(&self, inner: Box<dyn TransportStream>) -> Result<PoolStream> {
-        let inner: Box<dyn TransportStream> = match &self.obfs {
+    /// Apply the optional obfs layer to an already connected byte stream —
+    /// the single place every snell connection (fresh dial or a
+    /// relay-supplied stream) gets its obfs.  ShadowTLS runs its cover
+    /// handshake here and fails the dial rather than fall back to plain
+    /// snell when the relay cannot authenticate.
+    async fn apply_obfs(
+        &self,
+        inner: Box<dyn TransportStream>,
+    ) -> Result<Box<dyn TransportStream>> {
+        Ok(match &self.obfs {
             SnellObfs::None => inner,
             SnellObfs::Http { host } => Box::new(
                 HttpObfs::new(inner, host.clone(), self.port)
@@ -202,12 +246,23 @@ impl SnellAdapter {
                 TlsObfs::new(inner, server.clone())
                     .map_err(|e| MeowError::Config(format!("snell obfs: {e}")))?,
             ),
-        };
-        Ok(match (&self.v6, self.version) {
+            SnellObfs::ShadowTls { config, .. } => {
+                let tls = self
+                    .shadow_tls
+                    .as_ref()
+                    .expect("shadow-tls layer built with the obfs mode");
+                shadow_tls_plugin::handshake_over(config, tls, inner).await?
+            }
+        })
+    }
+
+    /// Wrap an obfs-applied byte stream in the Snell AEAD codec.
+    fn wrap_codec(&self, inner: Box<dyn TransportStream>) -> PoolStream {
+        match (&self.v6, self.version) {
             (Some(codec), _) => Snell::new_v6(inner, Arc::clone(&self.psk), codec.clone()),
             (None, SnellVersion::V3) => Snell::new_v3(inner, Arc::clone(&self.psk)),
             (None, _) => Snell::new(inner, Arc::clone(&self.psk)),
-        })
+        }
     }
 
     /// v6 TCP dial. The request (always `CommandConnectV2`: v6 servers keep
@@ -333,8 +388,8 @@ impl ProxyAdapter for SnellAdapter {
             host, port, self.addr_str
         );
 
-        let inner: Box<dyn TransportStream> = Box::new(stream);
-        let mut snell = self.wrap_stream(inner)?;
+        let inner = self.apply_obfs(Box::new(stream)).await?;
+        let mut snell = self.wrap_codec(inner);
         if self.v6.is_some() {
             let request = connect_request(&host, port, true).map_err(MeowError::Io)?;
             snell.defer_request(request).map_err(MeowError::Io)?;

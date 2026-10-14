@@ -10,7 +10,12 @@ homepage.workspace = true
 
 [features]
 default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
-ss = ["dep:shadowsocks", "meow-transport/simple-obfs", "meow-transport/shadow-tls", "meow-transport/restls", "meow-transport/jls"]
+ss = ["dep:shadowsocks", "meow-transport/simple-obfs", "shadow-tls", "meow-transport/restls", "meow-transport/jls"]
+# ShadowTLS v1/v2/v3 client — the `plugin: shadow-tls` SS plugin and Snell's
+# `obfs-opts.mode: shadow-tls` share one options parser and one transport.
+# Implied by `ss` and `snell` (both bundles already carry `ss`, so this adds
+# nothing to either profile — ADR-0007).
+shadow-tls = ["meow-transport/shadow-tls"]
 trojan = []
 vless = []
 vmess = ["dep:md-5", "dep:hmac", "dep:aes", "dep:boring", "dep:crc32fast"]
@@ -34,7 +39,7 @@ vless-encryption = [
 # the SS simple-obfs module), UDP-over-TCP, and an opt-in v4–v6 reuse pool
 # (CommandConnectV2). v6's PSK-derived traffic-shaping profile is seeded
 # with BLAKE2b.
-snell = ["dep:argon2", "dep:boring", "dep:blake2", "meow-transport/simple-obfs"]
+snell = ["dep:argon2", "dep:boring", "dep:blake2", "meow-transport/simple-obfs", "shadow-tls"]
 # Opt-in anytls outbound (uses the vendored `meow-anytls` crate, lib name
 # `anytls_rs`). The client's TLS is supplied by meow-transport's BoringSSL
 # TlsLayer through anytls-rs's `TlsConnect` hook, so no second TLS stack.
