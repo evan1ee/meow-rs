@@ -308,10 +308,17 @@ async fn v3_relay_server(mut tcp: TcpStream, conn: &mut ServerConnection, passwo
     conn.read_tls(&mut &ch[..]).unwrap();
     conn.process_new_packets().expect("cover TLS");
 
+    // Set once the cover rejects the client's (transcript-divergent)
+    // flight.  Its rejection alert is never pumped: a real cover sits a
+    // network hop from the relay, so the client's first data record —
+    // which trails its Finished immediately — switches the relay before
+    // the rejection lands (`shadow_tls_v3_e2e` exercises that race
+    // against the official server with a latency-modelled cover).
+    let mut cover_dead = false;
     let payload = 'switch: loop {
         // Pump whatever the cover wants to say, swizzling post-SH
         // appdata (SH random seeds the chains on first sight).
-        while conn.wants_write() {
+        while !cover_dead && conn.wants_write() {
             let mut produced = Vec::new();
             conn.write_tls(&mut produced).unwrap();
             let wire = asm.feed(&produced);
@@ -347,8 +354,17 @@ async fn v3_relay_server(mut tcp: TcpStream, conn: &mut ServerConnection, passwo
         }
         // Untagged record — relay into the (doomed) cover conn;
         // the client Finished never verifies server-side either.
-        let _ = conn.read_tls(&mut &rec[..]);
-        let _ = conn.process_new_packets();
+        // The v3 client never relays an alert (it swallows its own
+        // abort alert), so any record reaching the cover is flight.
+        assert_ne!(rec[0], 21, "v3 client must not send an alert to the cover");
+        assert_ne!(
+            rec[0], 23,
+            "untagged appdata from a v3 client is its (encrypted) abort alert"
+        );
+        if !cover_dead {
+            let _ = conn.read_tls(&mut &rec[..]);
+            cover_dead = conn.process_new_packets().is_err();
+        }
     };
 
     // Echo the payload back under the "S" chain.
@@ -646,4 +662,173 @@ async fn v3_hijacked_cover_fails() {
         "expected a shadow-tls handshake failure, got: {err}"
     );
     let _ = server.await;
+}
+
+// ─── v3 failure modes ───────────────────────────────────────────────────────
+
+/// Authentication failure: the relay holds a different password, so its
+/// swizzled cover records carry tags the client cannot verify — the dial
+/// must fail closed before any data path exists.
+#[tokio::test]
+async fn v3_wrong_password_fails_closed() {
+    install_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut conn, cert) = server_conn();
+
+    let server = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        // A relay with the wrong key: swizzle cover output under it
+        // (skipping the ClientHello tag check, which it would fail).
+        let mut asm = OutAssembler::new(3, b"some-other-password");
+        let ch = read_record(&mut tcp).await.unwrap();
+        conn.read_tls(&mut &ch[..]).unwrap();
+        conn.process_new_packets().expect("cover TLS");
+        while conn.wants_write() {
+            let mut produced = Vec::new();
+            conn.write_tls(&mut produced).unwrap();
+            let wire = asm.feed(&produced);
+            if tcp.write_all(&wire).await.is_err() {
+                return;
+            }
+        }
+        // Drain until the client hangs up.
+        let mut sink = [0u8; 1024];
+        while matches!(tcp.read(&mut sink).await, Ok(n) if n > 0) {}
+    });
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let layer = client_layer(3, &cert);
+    let err = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD, false)
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        err.contains("hmac mismatch"),
+        "wrong relay password must fail the record tag check, got: {err}"
+    );
+    server.await.unwrap();
+}
+
+/// A data record whose "S"-chain tag does not verify (tampered or forged
+/// after the switch) is rejected by the reader — never surfaced as data.
+#[tokio::test]
+async fn v3_tampered_server_record_rejected() {
+    install_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut conn, cert) = server_conn();
+    let password = PASSWORD.to_vec();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        // Run the honest relay into a pipe so its single echoed record can
+        // be corrupted on the way out.
+        let (relay_side, mut tap) = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            let c = TcpStream::connect(a).await.unwrap();
+            let (s, _) = l.accept().await.unwrap();
+            (s, c)
+        };
+        let relay = tokio::spawn(async move {
+            v3_relay_server(relay_side, &mut conn, &password).await;
+        });
+        let (mut tcp_r, mut tcp_w) = tcp.into_split();
+        let (mut tap_r, mut tap_w) = tap.split();
+        // Client → relay verbatim.
+        let up = async {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = tcp_r.read(&mut buf).await {
+                if n == 0 || tap_w.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        };
+        // Relay → client verbatim until the switch; flip one payload bit
+        // of the first post-switch record (the echo).
+        let down = async {
+            let mut tampered = false;
+            let mut hdr = [0u8; RECORD_HDR];
+            while tap_r.read_exact(&mut hdr).await.is_ok() {
+                let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; len];
+                if tap_r.read_exact(&mut body).await.is_err() {
+                    break;
+                }
+                // The echo is the only appdata record whose body ends in
+                // the plaintext payload.
+                if !tampered && hdr[0] == 23 && body.ends_with(b"v3-tamper") {
+                    let last = body.len() - 1;
+                    body[last] ^= 0x01;
+                    tampered = true;
+                }
+                if tcp_w.write_all(&hdr).await.is_err() || tcp_w.write_all(&body).await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            () = up => {}
+            () = down => {}
+        }
+        let _ = relay.await;
+    });
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let layer = client_layer(3, &cert);
+    let mut s = meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD, false)
+        .await
+        .expect("v3 dial");
+    s.write_all(b"v3-tamper").await.unwrap();
+    let mut out = [0u8; 32];
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut out))
+        .await
+        .expect("tampered record must not hang the reader");
+    match res {
+        Ok(n) => assert_eq!(n, 0, "tampered record surfaced as data: {:?}", &out[..n]),
+        Err(e) => assert!(
+            e.to_string().contains("shadow-tls") || e.to_string().contains("verif"),
+            "unexpected error: {e}"
+        ),
+    }
+    drop(s);
+    let _ = server.await;
+}
+
+/// Connection errors mid-handshake surface as dial errors, never hangs:
+/// the peer hangs up right after the ClientHello, or answers with
+/// non-TLS garbage.
+#[tokio::test]
+async fn v3_connection_errors_mid_handshake() {
+    install_crypto_provider();
+    for (case, reply) in [
+        ("eof", None),
+        ("garbage", Some(&b"HTTP/1.1 400 Bad\r\n\r\n"[..])),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let ch = read_record(&mut tcp).await.unwrap();
+            verify_ch_tag(&ch, PASSWORD);
+            if let Some(reply) = reply {
+                let _ = tcp.write_all(reply).await;
+            }
+            // Dropping `tcp` closes the connection.
+        });
+        let (_, cert) = server_conn();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let layer = client_layer(3, &cert);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            meow_transport::shadow_tls::dial(Box::new(tcp), &layer, 3, PASSWORD, false),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: dial must not hang"));
+        let err = res.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(!err.is_empty(), "{case}: dial must fail");
+        server.await.unwrap();
+    }
 }

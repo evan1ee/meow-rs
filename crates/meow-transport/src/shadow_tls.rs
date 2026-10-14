@@ -36,6 +36,25 @@
 //! cover record (authorization) and certificate verification itself did
 //! not fail.
 //!
+//! The abort must stay *local*.  The official server
+//! (`ihciah/shadow-tls` `relay_v3`) keeps relaying client records to the
+//! cover until one carries a valid "C"-chain tag, and if the cover
+//! closes first it shuts down its client-bound half for good — so
+//! anything that makes the cover give up before the first payload kills
+//! the session.  Two measures keep the wire shaped like a client that
+//! simply has not spoken yet:
+//!
+//! - the shim swallows the local stack's abort alert (an upstream client
+//!   completes its handshake and never sends one; relayed, it makes the
+//!   cover hang up), so on a **TLS 1.3** cover the cover just waits for a
+//!   Finished that never comes and an idle client keeps its session;
+//! - on a **TLS 1.2** cover the client's own Finished necessarily fails
+//!   the cover's check, so the handshake is ended locally the moment that
+//!   Finished is queued — the first payload then trails it immediately
+//!   and switches the relay before the cover's rejection arrives (a cover
+//!   RTT later).  A client that stays silent longer than that loses the
+//!   session; prefer TLS 1.3 covers (and `strict-mode`).
+//!
 //! The two cover versions differ on what "certificate verification" can
 //! mean: on a TLS 1.3 cover the certificate arrives encrypted under the
 //! (diverged) transcript, so BoringSSL never reaches the verify callback
@@ -74,6 +93,7 @@ pub const DEFAULT_ALPN: [&str; 2] = ["h2", "http/1.1"];
 const RECORD_HANDSHAKE: u8 = 22;
 const RECORD_APPDATA: u8 = 23;
 const RECORD_ALERT: u8 = 21;
+const RECORD_CHANGE_CIPHER_SPEC: u8 = 20;
 
 const RECORD_HDR: usize = crate::record_io::RECORD_HDR;
 /// Handshake message types (`record[5]` on a handshake record).
@@ -418,6 +438,12 @@ struct V3Handshake {
     /// the ServerHello) — upstream `isTLS13`.
     is_tls13: bool,
     authorized: bool,
+    /// TLS 1.2 cover: the client's ChangeCipherSpec went out.
+    client_ccs_sent: bool,
+    /// TLS 1.2 cover: the client's Finished went out — its cover flight
+    /// is complete, so the handshake is ended locally rather than waiting
+    /// for a server Finished that can never verify (see `poll_read`).
+    client_flight_done: bool,
 }
 
 /// `Default` so `mem::take` can pull the shim (and its inner conn) back
@@ -443,6 +469,8 @@ impl HandshakeShim {
                 read_key: None,
                 is_tls13: false,
                 authorized: false,
+                client_ccs_sent: false,
+                client_flight_done: false,
             })),
             _ => Mode::V1,
         };
@@ -637,6 +665,39 @@ impl HandshakeShim {
 }
 
 impl V3Handshake {
+    /// Whether an outbound record from the local TLS stack must be dropped
+    /// instead of relayed to the cover.
+    ///
+    /// The patched ClientHello diverges the transcript, so once the
+    /// ServerHello is in the local stack can only *abort*: on a TLS 1.3
+    /// cover it fails to decrypt the first encrypted record, on a TLS 1.2
+    /// cover the cover rejects its Finished.  The abort alert (plaintext
+    /// type 21, or a type-23 record once TLS 1.3 handshake keys are
+    /// installed — the only type-23 record the stack can emit there) is an
+    /// artifact of this implementation: an upstream client completes the
+    /// handshake and never sends one.  Relaying it makes the cover close
+    /// the connection, and the official server (`ihciah/shadow-tls`
+    /// `relay_v3`) then shuts down its client-bound half — the session
+    /// would die before the first payload could switch the relay to data.
+    fn swallows_client_record(&self, rec_type: u8) -> bool {
+        self.server_random.is_some()
+            && (rec_type == RECORD_ALERT || (self.is_tls13 && rec_type == RECORD_APPDATA))
+    }
+
+    /// Track the TLS 1.2 client flight: the first handshake record after
+    /// the client's ChangeCipherSpec is its Finished — the last thing the
+    /// client ever sends to the cover.
+    fn note_client_record(&mut self, rec_type: u8) {
+        if self.server_random.is_none() || self.is_tls13 {
+            return;
+        }
+        match rec_type {
+            RECORD_CHANGE_CIPHER_SPEC => self.client_ccs_sent = true,
+            RECORD_HANDSHAKE if self.client_ccs_sent => self.client_flight_done = true,
+            _ => {}
+        }
+    }
+
     /// Verify + de-swizzle one cover `application_data` record in place:
     /// check the embedded tag against the rolling handshake chain, un-XOR
     /// the payload, and shrink the record back to a normal TLS record.
@@ -810,6 +871,21 @@ impl AsyncRead for HandshakeShim {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
         }
+        // TLS 1.2 cover, client Finished queued: end the doomed handshake
+        // now instead of waiting for the server's CCS/Finished.  The cover
+        // rejects our (transcript-divergent) Finished and closes, which
+        // makes the official relay tear down its client-bound half — the
+        // first payload must trail the Finished immediately to switch the
+        // relay to data before that.  Certificate verification already ran
+        // on the plaintext server flight, so `dial_v3` still gates on it;
+        // any unwritten tail of the flight is carried into the data stream.
+        if let Mode::V3(v3) = &self.mode {
+            if v3.client_flight_done && self.pending.is_empty() {
+                return Poll::Ready(Err(io_err(
+                    "shadow-tls: v3 TLS 1.2 cover flight sent; switching to data",
+                )));
+            }
+        }
         if self.pending.is_empty() {
             match &mut self.mode {
                 Mode::V2 { .. } | Mode::V1 => {
@@ -884,8 +960,9 @@ impl AsyncWrite for HandshakeShim {
             }
             // ClientHello records need a mutable copy for the session-id
             // patch; every other record moves verbatim into the outbox.
+            let rec_type = this.wbuf[0];
             if total > RECORD_HDR
-                && this.wbuf[0] == RECORD_HANDSHAKE
+                && rec_type == RECORD_HANDSHAKE
                 && this.wbuf[RECORD_HDR] == HANDSHAKE_CLIENT_HELLO
             {
                 let mut record: Vec<u8> = this.wbuf.drain(..total).collect();
@@ -894,7 +971,13 @@ impl AsyncWrite for HandshakeShim {
                     Err(e) => return Poll::Ready(Err(e)),
                 }
                 this.outbox.extend(record);
+            } else if v3.swallows_client_record(rec_type) {
+                // The local stack's abort alert for the doomed cover
+                // handshake — never let it reach the relay (see
+                // `swallows_client_record`).
+                this.wbuf.drain(..total);
             } else {
+                v3.note_client_record(rec_type);
                 this.outbox.extend(this.wbuf.drain(..total));
             }
         }
@@ -1351,6 +1434,106 @@ mod tests {
         rec.extend((body.len() as u16).to_be_bytes());
         rec.extend(body);
         rec
+    }
+
+    fn v3_after_server_hello(is_tls13: bool) -> V3Handshake {
+        V3Handshake {
+            password: PASSWORD.into(),
+            server_random: Some([9u8; TLS_RANDOM_LEN]),
+            orig_sid: None,
+            read_hmac: None,
+            read_key: None,
+            is_tls13,
+            authorized: true,
+            client_ccs_sent: false,
+            client_flight_done: false,
+        }
+    }
+
+    /// The abort alert of the doomed cover handshake never reaches the
+    /// relay; genuine flight records (CCS, TLS 1.2 handshake) still do.
+    #[test]
+    fn v3_swallows_only_the_abort_alert() {
+        let tls13 = v3_after_server_hello(true);
+        assert!(tls13.swallows_client_record(RECORD_ALERT));
+        assert!(
+            tls13.swallows_client_record(RECORD_APPDATA),
+            "encrypted 1.3 alert rides a type-23 record"
+        );
+        assert!(!tls13.swallows_client_record(RECORD_CHANGE_CIPHER_SPEC));
+
+        let tls12 = v3_after_server_hello(false);
+        assert!(tls12.swallows_client_record(RECORD_ALERT));
+        assert!(!tls12.swallows_client_record(RECORD_HANDSHAKE));
+        assert!(!tls12.swallows_client_record(RECORD_CHANGE_CIPHER_SPEC));
+
+        // Before the ServerHello nothing is swallowed.
+        let mut early = v3_after_server_hello(true);
+        early.server_random = None;
+        assert!(!early.swallows_client_record(RECORD_ALERT));
+        assert!(!early.swallows_client_record(RECORD_APPDATA));
+    }
+
+    /// TLS 1.2 cover: the flight is done at the first handshake record
+    /// after the client's CCS (its Finished) — not at the ClientKeyExchange
+    /// that precedes the CCS, and never on a TLS 1.3 cover.
+    #[test]
+    fn v3_tls12_flight_done_at_finished() {
+        let mut v3 = v3_after_server_hello(false);
+        v3.note_client_record(RECORD_HANDSHAKE); // ClientKeyExchange
+        assert!(!v3.client_flight_done);
+        v3.note_client_record(RECORD_CHANGE_CIPHER_SPEC);
+        assert!(!v3.client_flight_done);
+        v3.note_client_record(RECORD_HANDSHAKE); // Finished
+        assert!(v3.client_flight_done);
+
+        let mut v3 = v3_after_server_hello(true);
+        v3.note_client_record(RECORD_CHANGE_CIPHER_SPEC);
+        v3.note_client_record(RECORD_HANDSHAKE);
+        assert!(!v3.client_flight_done, "1.3 covers never end early");
+    }
+
+    /// Through the shim's write path: a TLS 1.3 abort alert is dropped
+    /// while the CCS before it still reaches the wire; a TLS 1.2 Finished
+    /// makes the next read fail locally instead of waiting on the cover.
+    #[tokio::test]
+    async fn v3_shim_write_path_drops_alert_and_ends_tls12_flight() {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let mut shim = HandshakeShim::new(Box::new(client), 3, PASSWORD);
+        let Mode::V3(v3) = &mut shim.mode else {
+            unreachable!()
+        };
+        *v3 = Box::new(v3_after_server_hello(true));
+        shim.write_all(&[RECORD_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1])
+            .await
+            .unwrap();
+        let mut alert = vec![RECORD_APPDATA, 3, 3, 0, 19];
+        alert.extend([0xAB; 19]);
+        shim.write_all(&alert).await.unwrap();
+        shim.flush().await.unwrap();
+        drop(shim);
+        let mut wire = Vec::new();
+        peer.read_to_end(&mut wire).await.unwrap();
+        assert_eq!(wire, [RECORD_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1]);
+
+        let (client, _peer) = tokio::io::duplex(4096);
+        let mut shim = HandshakeShim::new(Box::new(client), 3, PASSWORD);
+        let Mode::V3(v3) = &mut shim.mode else {
+            unreachable!()
+        };
+        *v3 = Box::new(v3_after_server_hello(false));
+        shim.write_all(&[RECORD_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1])
+            .await
+            .unwrap();
+        shim.write_all(&[RECORD_HANDSHAKE, 3, 3, 0, 2, 0x14, 0])
+            .await
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let err = shim.read(&mut buf).await.unwrap_err();
+        assert!(
+            err.to_string().contains("TLS 1.2 cover flight sent"),
+            "{err}"
+        );
     }
 
     /// Server-side tag check (upstream `verifyClientHello`):

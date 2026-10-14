@@ -51,7 +51,23 @@ No additional forks are planned unless changes to an upstream dependency prove n
 
 ## Status
 
-**In development.** ShadowTLS v3 support is a development goal and should not be considered functional until implementation and interoperability tests pass.
+**Functional — interoperability tests pass against the official ShadowTLS v3 server.**
+
+| Plan step | Where |
+|-----------|-------|
+| 1. Inspect SS outbound + TLS transport | `plugin: shadow-tls` on `type: ss` (`crates/meow-proxy/src/shadowsocks_adapter.rs`) over the BoringSSL `TlsLayer` |
+| 2. v3 handshake + stream transport | `crates/meow-transport/src/shadow_tls.rs`: tagged ClientHello session id, swizzled-record authorization, rolling-HMAC data framing |
+| 3. Config parser integration | `crates/meow-proxy/src/shadow_tls_plugin.rs` (`plugin-opts`), `crates/meow-config/src/proxy_parser.rs`; the example above is pinned by `test_shadow_tls_v3_documented_node` |
+| 4. Unit + integration tests | `crates/meow-transport/tests/shadow_tls_test.rs` (handshakes, TCP transfer, wrong password, tampered records, mid-handshake EOF/garbage, strict mode) plus unit tests in the modules above |
+| 5. Official-server interop | `crates/meow-proxy/tests/shadow_tls_v3_e2e.rs`, SS `chacha20-ietf-poly1305` through `ihciah/shadow-tls` v0.2.25 (`scripts/fetch-shadowtls-server.sh`), wired into CI |
+| 6. UDP + limitations | [docs/plugins/shadow-tls.md](docs/plugins/shadow-tls.md): a shadow-tls node carries no UDP (`udp: true` is accepted and UDP flows fall through to another rule); TLS 1.3 covers are recommended |
+
+Interop testing found and fixed one real incompatibility. The client's
+local TLS stack sent an abort alert to the cover after its (expected)
+handshake failure. That made the cover hang up, and the official server
+then tore down the session before the first payload. The alert is now
+swallowed. On TLS 1.2 covers the client ends the handshake as soon as its
+Finished is sent, so the first payload switches the relay in time.
 
 ## License
 

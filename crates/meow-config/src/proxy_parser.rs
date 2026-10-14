@@ -3725,6 +3725,59 @@ tls: true
         assert!(err.contains("version"), "msg: {err}");
     }
 
+    /// The documented ShadowTLS v3 node (docs/shadow-tls.md), verbatim:
+    /// SS `chacha20-ietf-poly1305` + `plugin: shadow-tls` with YAML-typed
+    /// opts (`version: 3` int, `skip-cert-verify: false` bool) and the
+    /// node-level `client-fingerprint`.  `udp: true` is accepted, but the
+    /// node does not advertise UDP — shadow-tls carries no datagrams, so
+    /// the rule probe falls through to a UDP-capable target instead of
+    /// sending raw SS UDP around the disguise.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn test_shadow_tls_v3_documented_node() {
+        let cfg = proxy_config(
+            "name: ss-shadowtls\ntype: ss\nserver: 203.0.113.10\nport: 6443\n\
+             cipher: chacha20-ietf-poly1305\npassword: ss-secret\nudp: true\n\
+             plugin: shadow-tls\nclient-fingerprint: chrome\nplugin-opts:\n  \
+             host: www.example.com\n  password: stls-secret\n  version: 3\n  \
+             skip-cert-verify: false\n",
+        );
+        let adapter = parse_proxy(&cfg).expect("documented shadow-tls v3 node must parse");
+        assert_eq!(adapter.name(), "ss-shadowtls");
+        assert_eq!(adapter.adapter_type(), AdapterType::Shadowsocks);
+        assert_eq!(adapter.addr(), "203.0.113.10:6443");
+        assert!(
+            !adapter.support_udp(),
+            "shadow-tls carries no UDP — the node must not advertise it"
+        );
+
+        // Typed-YAML variants of the same opts round-trip through the
+        // SIP003 serialization too.
+        for opts in [
+            "  version: '3'\n",
+            "  version: 3\n  strict-mode: true\n  skip-cert-verify: true\n",
+            "  version: 3\n  alpn: [h2]\n",
+        ] {
+            let cfg = proxy_config(&format!(
+                "name: n\ntype: ss\nserver: 203.0.113.10\nport: 6443\n\
+                 cipher: chacha20-ietf-poly1305\npassword: ss-secret\n\
+                 plugin: shadow-tls\nplugin-opts:\n  host: www.example.com\n  \
+                 password: stls-secret\n{opts}"
+            ));
+            parse_proxy(&cfg).unwrap_or_else(|e| panic!("opts {opts:?}: {e}"));
+        }
+
+        // A non-boolean `skip-cert-verify` is a config error, never a
+        // silent downgrade to an unverified cover.
+        let cfg = proxy_config(
+            "name: n\ntype: ss\nserver: 203.0.113.10\nport: 6443\n\
+             cipher: chacha20-ietf-poly1305\npassword: ss-secret\n\
+             plugin: shadow-tls\nplugin-opts:\n  host: www.example.com\n  \
+             password: stls-secret\n  version: 3\n  skip-cert-verify: maybe\n",
+        );
+        assert!(parse_proxy(&cfg).is_err());
+    }
+
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
     /// the in-process restls parser → adapter construction.
     #[cfg(feature = "ss")]

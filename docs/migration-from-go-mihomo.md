@@ -156,7 +156,9 @@ is called out explicitly.
 
 Fully supported including AEAD-2022 ciphers. The built-in `v2ray-plugin`
 and `gost-plugin` WebSocket transports are included, along with
-`shadow-tls` (all three protocol versions), `restls` (both
+`shadow-tls` (all three protocol versions; v3 is interop-tested against
+the official server, and unlike upstream a `shadow-tls` node does not
+carry UDP — see [plugins/shadow-tls.md](plugins/shadow-tls.md)), `restls` (both
 `version-hint` modes; `force-tls12` maps to the `tls12` path), `jls`
 (hello-random authentication over a real TLS 1.3 handshake) and
 `kcptun` (KCP ARQ with crypt/FEC/snappy over a smux v1 session pool;
