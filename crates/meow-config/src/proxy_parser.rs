@@ -3946,7 +3946,10 @@ tls: true
     /// TLS to a ShadowTLS relay, which forwards it to the real cover.
     #[test]
     fn test_reject_unsupported_transport_opts() {
-        let mut nodes: Vec<(&str, String)> = Vec::new();
+        let mut nodes: Vec<(&str, String)> = vec![(
+            "socks5",
+            "name: k\ntype: socks5\nserver: 1.2.3.4\nport: 1080\n".into(),
+        )];
         #[cfg(feature = "trojan")]
         nodes.push((
             "trojan",
@@ -3970,10 +3973,6 @@ tls: true
         nodes.push((
             "snell",
             "name: s\ntype: snell\nserver: 1.2.3.4\nport: 1\npsk: p\nversion: 4\n".into(),
-        ));
-        nodes.push((
-            "socks5",
-            "name: k\ntype: socks5\nserver: 1.2.3.4\nport: 1080\n".into(),
         ));
         for (ty, base) in &nodes {
             parse_proxy(&proxy_config(base)).unwrap_or_else(|e| panic!("{ty} base: {e}"));
