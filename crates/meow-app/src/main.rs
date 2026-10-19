@@ -1668,8 +1668,8 @@ impl WindowsSystemProxyGuard {
     }
 
     fn enable_if_needed(port: u16) -> Option<Self> {
-        let enabled = Self::query_value("ProxyEnable")
-            .is_some_and(|v| v.trim() == "0x1" || v.trim() == "1");
+        let enabled =
+            Self::query_value("ProxyEnable").is_some_and(|v| v.trim() == "0x1" || v.trim() == "1");
         if enabled {
             return None;
         }

@@ -189,4 +189,3 @@ async fn lazy_skips_dns_when_process_rule_precedes_domain_and_ip_rule() {
         "PROCESS-NAME miss followed by DOMAIN-SUFFIX hit must not trigger DNS resolution",
     );
 }
-
