@@ -236,6 +236,60 @@ pub fn interface_metric_v4(index: u32) -> Option<u32> {
     }
 }
 
+/// Query the IPv4 DNS servers configured on the Windows host via
+/// `GetNetworkParams`, filtering out unspecified (`0.0.0.0`), loopback
+/// (`127.0.0.0/8`), and RFC 2544 / Clash fake-IP (`198.18.0.0/15`) addresses
+/// so a TUN adapter's synthetic DNS entry is never selected as an upstream
+/// system resolver.
+#[cfg(target_os = "windows")]
+pub fn windows_system_dns_servers() -> Vec<std::net::IpAddr> {
+    use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetNetworkParams, FIXED_INFO_W2KSP1, IP_ADDR_STRING,
+    };
+
+    let mut size: u32 = 0;
+    // SAFETY: probing required buffer size with null pointer and valid out-pointer.
+    let rc = unsafe { GetNetworkParams(std::ptr::null_mut(), &raw mut size) };
+    if rc != ERROR_BUFFER_OVERFLOW || size < std::mem::size_of::<FIXED_INFO_W2KSP1>() as u32 {
+        return Vec::new();
+    }
+
+    let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+    let info_ptr = buf.as_mut_ptr().cast::<FIXED_INFO_W2KSP1>();
+    // SAFETY: `buf` is 8-byte aligned and holds at least `size` bytes.
+    if unsafe { GetNetworkParams(info_ptr, &raw mut size) } != 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    // SAFETY: `info_ptr` was initialized by `GetNetworkParams` above and links
+    // nodes within `buf`.
+    unsafe {
+        let mut cur: *const IP_ADDR_STRING = &raw const (*info_ptr).DnsServerList;
+        while !cur.is_null() {
+            let raw_bytes = &(*cur).IpAddress.String;
+            let bytes: &[u8] =
+                std::slice::from_raw_parts(raw_bytes.as_ptr().cast::<u8>(), raw_bytes.len());
+            let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            if let Ok(s) = std::str::from_utf8(&bytes[..len]) {
+                if let Ok(ip) = s.trim().parse::<std::net::Ipv4Addr>() {
+                    let [a, b, _, _] = ip.octets();
+                    let is_fake_ip = a == 198 && (b & 0xfe) == 18;
+                    if !ip.is_unspecified() && !ip.is_loopback() && !is_fake_ip {
+                        let addr = std::net::IpAddr::V4(ip);
+                        if !out.contains(&addr) {
+                            out.push(addr);
+                        }
+                    }
+                }
+            }
+            cur = (*cur).Next;
+        }
+    }
+    out
+}
+
 /// Register a validated interface as the newest owner.
 fn push_owner(iface: Arc<str>, index: u32) -> OutboundIfaceGuard {
     let id = NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed);

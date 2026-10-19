@@ -124,7 +124,8 @@ finally:
     except OSError:
         pass
 "#;
-    for bin in ["python3", "python"] {
+    let mut errs = Vec::new();
+    for bin in ["python", "python3"] {
         match Command::new(bin)
             .arg("-c")
             .arg(py)
@@ -135,12 +136,13 @@ finally:
             .status()
         {
             Ok(st) if st.success() => return Ok(()),
-            Ok(st) => return Err(format!("{bin} exited {st}")),
-            Err(_) => continue,
+            Ok(st) => errs.push(format!("{bin} exited {st}")),
+            Err(e) => errs.push(format!("{bin} could not be spawned: {e}")),
         }
     }
     Err(format!(
-        "no python interpreter (needed to fetch Wintun {WINTUN_VERSION})"
+        "no working python interpreter (needed to fetch Wintun {WINTUN_VERSION}): {}",
+        errs.join("; ")
     ))
 }
 

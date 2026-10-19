@@ -274,9 +274,12 @@ pub enum LazyMatchOutcome<'a> {
 
 /// The scan cannot evaluate this slot yet: its predicate demands a field
 /// that is missing from the metadata but can still be materialized.
-fn slot_blocked(slot: &CompiledRuleSlot, input: &MatchInput<'_>) -> bool {
+fn slot_blocked<const DEMAND_PROCESS: bool>(
+    slot: &CompiledRuleSlot,
+    input: &MatchInput<'_>,
+) -> bool {
     (slot.demands_ip && ip_missing(input))
-        || (slot.demands_process && process_missing(input.metadata))
+        || (DEMAND_PROCESS && slot.demands_process && process_missing(input.metadata))
 }
 
 /// `dst_ip` is absent but resolvable: there is a hostname the enricher can
@@ -678,6 +681,30 @@ impl CompiledRuleSet {
         rules: &'a [Box<dyn Rule>],
         probe: &dyn TargetProbe,
     ) -> LazyMatchOutcome<'a> {
+        self.match_rules_lazy_ctl::<true>(metadata, rules, probe)
+    }
+
+    /// Resume a lazy scan after process enrichment has already been attempted.
+    ///
+    /// Process-demanding slots are evaluated with whatever process fields were
+    /// discovered (or empty strings if the socket was not found in the OS
+    /// table) and never re-block, while IP-demanding slots still stop for lazy
+    /// DNS resolution if reached.
+    pub fn match_rules_lazy_after_process<'a>(
+        &'a self,
+        metadata: &Metadata,
+        rules: &'a [Box<dyn Rule>],
+        probe: &dyn TargetProbe,
+    ) -> LazyMatchOutcome<'a> {
+        self.match_rules_lazy_ctl::<false>(metadata, rules, probe)
+    }
+
+    fn match_rules_lazy_ctl<'a, const DEMAND_PROCESS: bool>(
+        &'a self,
+        metadata: &Metadata,
+        rules: &'a [Box<dyn Rule>],
+        probe: &dyn TargetProbe,
+    ) -> LazyMatchOutcome<'a> {
         debug_assert_eq!(
             self.source_rule_count,
             rules.len(),
@@ -697,7 +724,7 @@ impl CompiledRuleSet {
             let input = MatchInput::new(metadata);
             'scan: {
                 if self.execution_plan == ExecutionPlan::LinearScan {
-                    break 'scan match self.scan_range_ctl::<true, true>(
+                    break 'scan match self.scan_range_ctl::<true, true, DEMAND_PROCESS>(
                         0..self.slots.len(),
                         &input,
                         rules,
@@ -706,7 +733,9 @@ impl CompiledRuleSet {
                         &mut on_missing,
                     ) {
                         ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
-                        ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
+                        ScanOutcome::Blocked { pos } => {
+                            self.enrichment_needs::<DEMAND_PROCESS>(pos, &input)
+                        }
                         ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
                     };
                 }
@@ -728,7 +757,7 @@ impl CompiledRuleSet {
                     None => (self.slots.len(), None),
                 };
 
-                match self.scan_range_ctl::<true, false>(
+                match self.scan_range_ctl::<true, false, DEMAND_PROCESS>(
                     0..scan_end,
                     &input,
                     rules,
@@ -743,7 +772,7 @@ impl CompiledRuleSet {
                     // it, so enrichment is needed even though a domain rule
                     // stands ready.
                     ScanOutcome::Blocked { pos } => {
-                        break 'scan self.enrichment_needs(pos, &input);
+                        break 'scan self.enrichment_needs::<DEMAND_PROCESS>(pos, &input);
                     }
                     ScanOutcome::Exhausted => {}
                 }
@@ -761,7 +790,7 @@ impl CompiledRuleSet {
                     tail_start += 1;
                 }
 
-                match self.scan_range_ctl::<true, true>(
+                match self.scan_range_ctl::<true, true, DEMAND_PROCESS>(
                     tail_start..self.slots.len(),
                     &input,
                     rules,
@@ -770,7 +799,9 @@ impl CompiledRuleSet {
                     &mut on_missing,
                 ) {
                     ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
-                    ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
+                    ScanOutcome::Blocked { pos } => {
+                        self.enrichment_needs::<DEMAND_PROCESS>(pos, &input)
+                    }
                     ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
                 }
             }
@@ -784,18 +815,32 @@ impl CompiledRuleSet {
         outcome
     }
 
-    /// Union the demands of every slot at or after `from_pos`, filtered to
-    /// the fields actually missing from this connection's metadata, so one
-    /// enrichment round suffices before the strict re-match.
-    fn enrichment_needs(&self, from_pos: usize, input: &MatchInput<'_>) -> LazyMatchOutcome<'_> {
-        let mut needs_ip = false;
-        let mut needs_process = false;
-        for slot in &self.slots[from_pos..] {
-            needs_ip |= slot.demands_ip;
-            needs_process |= slot.demands_process;
+    /// Compute the metadata enrichment needed to advance past `from_pos`.
+    ///
+    /// When the blocking slot at `from_pos` only demands process info, we
+    /// deliberately do NOT union `demands_ip` from later slots: process lookup
+    /// is a local OS table query, and resuming the lazy scan after process
+    /// enrichment lets intervening DOMAIN / GEOSITE rules match without a
+    /// network DNS lookup. When the blocking slot already demands IP
+    /// resolution, we also check whether any subsequent slot demands process
+    /// info so one enrichment round suffices before the strict re-match.
+    fn enrichment_needs<const DEMAND_PROCESS: bool>(
+        &self,
+        from_pos: usize,
+        input: &MatchInput<'_>,
+    ) -> LazyMatchOutcome<'_> {
+        let first = &self.slots[from_pos];
+        let needs_ip = first.demands_ip && ip_missing(input);
+        let mut needs_process =
+            DEMAND_PROCESS && first.demands_process && process_missing(input.metadata);
+        if DEMAND_PROCESS && needs_ip && !needs_process && process_missing(input.metadata) {
+            for slot in &self.slots[from_pos + 1..] {
+                if slot.demands_process {
+                    needs_process = true;
+                    break;
+                }
+            }
         }
-        needs_ip &= ip_missing(input);
-        needs_process &= process_missing(input.metadata);
         debug_assert!(
             needs_ip || needs_process,
             "scan blocked without an actionable demand",
@@ -851,9 +896,9 @@ impl CompiledRuleSet {
         probe: &dyn TargetProbe,
         on_missing: &mut dyn FnMut(CompiledMatchResult<'a>),
     ) -> Option<CompiledMatchResult<'a>> {
-        match self
-            .scan_range_ctl::<false, EVAL_TRIE>(range, input, rules, helper, probe, on_missing)
-        {
+        match self.scan_range_ctl::<false, EVAL_TRIE, false>(
+            range, input, rules, helper, probe, on_missing,
+        ) {
             ScanOutcome::Matched(matched) => Some(matched),
             ScanOutcome::Blocked { .. } | ScanOutcome::Exhausted => None,
         }
@@ -873,7 +918,12 @@ impl CompiledRuleSet {
     /// miss-scan hot path is unchanged (issue #513). The sink is a callback
     /// so the lazy path can defer warnings when a strict re-scan will
     /// re-emit them.
-    fn scan_range_ctl<'a, const STOP_ON_DEMAND: bool, const EVAL_TRIE: bool>(
+    fn scan_range_ctl<
+        'a,
+        const STOP_ON_DEMAND: bool,
+        const EVAL_TRIE: bool,
+        const DEMAND_PROCESS: bool,
+    >(
         &'a self,
         range: Range<usize>,
         input: &MatchInput<'_>,
@@ -884,7 +934,7 @@ impl CompiledRuleSet {
     ) -> ScanOutcome<'a> {
         let start = range.start;
         for (offset, slot) in self.slots[range].iter().enumerate() {
-            if STOP_ON_DEMAND && slot_blocked(slot, input) {
+            if STOP_ON_DEMAND && slot_blocked::<DEMAND_PROCESS>(slot, input) {
                 return ScanOutcome::Blocked {
                     pos: start + offset,
                 };

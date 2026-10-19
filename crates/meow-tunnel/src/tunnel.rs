@@ -434,7 +434,7 @@ impl TunnelInner {
             LazyMatchOutcome::Matched(m) => Some(self.materialize_rule_match(&route, Some(m))),
             LazyMatchOutcome::NoMatch => Some(self.materialize_rule_match(&route, None)),
             LazyMatchOutcome::NeedsEnrichment {
-                needs_ip,
+                mut needs_ip,
                 needs_process,
             } => {
                 // Process enrichment matches `resolve_proxy`: the enriched
@@ -445,6 +445,27 @@ impl TunnelInner {
                 } else {
                     None
                 };
+                if needs_process && !needs_ip {
+                    let match_metadata = enriched.as_ref().unwrap_or(metadata);
+                    let probe = Self::target_probe(&route, match_metadata);
+                    match route.compiled_rules.match_rules_lazy_after_process(
+                        match_metadata,
+                        route.rules.as_ref(),
+                        &probe,
+                    ) {
+                        LazyMatchOutcome::Matched(m) => {
+                            return Some(self.materialize_rule_match(&route, Some(m)));
+                        }
+                        LazyMatchOutcome::NoMatch => {
+                            return Some(self.materialize_rule_match(&route, None));
+                        }
+                        LazyMatchOutcome::NeedsEnrichment {
+                            needs_ip: ip_now, ..
+                        } => {
+                            needs_ip = ip_now;
+                        }
+                    }
+                }
                 if needs_ip {
                     // `needs_ip` already encodes the `pre_resolve` guards:
                     // host present, dst_ip absent.

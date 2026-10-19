@@ -1298,6 +1298,8 @@ async fn run(
     // startup logs and the API snapshot (`GET /listeners`) below.
     use meow_config::ListenerSpec;
 
+    let mut bound_proxy_port: Option<u16> = None;
+    let _ = &mut bound_proxy_port;
     let mut named_listeners = config.listeners.named.clone();
     for nl in &mut named_listeners {
         let addr = bind_socket_addr(&nl.listen, nl.port)
@@ -1318,6 +1320,11 @@ async fn run(
                     };
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
+                    if bound_proxy_port.is_none()
+                        && matches!(nl.spec, ListenerSpec::Mixed | ListenerSpec::Http)
+                    {
+                        bound_proxy_port = Some(bound.port());
+                    }
                     let listener = MixedListener::new(tunnel.clone(), bound, nl.name.clone())
                         .with_sniffer(Arc::clone(&sniffer_runtime))
                         .with_auth(Arc::clone(&auth))
@@ -1600,6 +1607,13 @@ async fn run(
         }
     }
 
+    #[cfg(all(target_os = "windows", not(test)))]
+    let _sys_proxy_guard = if matches!(shutdown, ShutdownSignal::Console) {
+        bound_proxy_port.and_then(WindowsSystemProxyGuard::enable_if_needed)
+    } else {
+        None
+    };
+
     if let Some(on_ready) = on_ready {
         on_ready()?;
     }
@@ -1608,8 +1622,129 @@ async fn run(
     // Wait for shutdown signal
     shutdown.wait().await?;
     info!("Shutting down...");
+    #[cfg(feature = "listener-tun")]
+    tunnel.stop_tun().await;
 
     Ok(())
+}
+
+/// RAII guard for Windows System Proxy (`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`).
+///
+/// When `meow` runs interactively on the Windows console and no system proxy is
+/// currently enabled (`ProxyEnable == 0`, e.g. after closing Clash Verge), this
+/// points the user's system proxy at the bound local Mixed/HTTP listener port
+/// and restores `ProxyEnable = 0` (plus any previous `ProxyServer` value) on
+/// shutdown. If a system proxy is already enabled (`ProxyEnable == 1`), it is
+/// left untouched.
+#[cfg(all(target_os = "windows", not(test)))]
+struct WindowsSystemProxyGuard {
+    prev_server: Option<String>,
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+impl WindowsSystemProxyGuard {
+    const REG_KEY: &'static str =
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+    fn query_value(name: &str) -> Option<String> {
+        let output = std::process::Command::new("reg")
+            .args(["query", Self::REG_KEY, "/v", name])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix(name) {
+                let mut parts = rest.split_whitespace();
+                let _reg_type = parts.next()?;
+                let val: String = parts.collect::<Vec<_>>().join(" ");
+                return Some(val);
+            }
+        }
+        None
+    }
+
+    fn enable_if_needed(port: u16) -> Option<Self> {
+        let enabled = Self::query_value("ProxyEnable")
+            .is_some_and(|v| v.trim() == "0x1" || v.trim() == "1");
+        if enabled {
+            return None;
+        }
+        let prev_server = Self::query_value("ProxyServer");
+        let target = format!("127.0.0.1:{port}");
+        let set_server = std::process::Command::new("reg")
+            .args([
+                "add",
+                Self::REG_KEY,
+                "/v",
+                "ProxyServer",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &target,
+                "/f",
+            ])
+            .output();
+        let set_enable = std::process::Command::new("reg")
+            .args([
+                "add",
+                Self::REG_KEY,
+                "/v",
+                "ProxyEnable",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                "1",
+                "/f",
+            ])
+            .output();
+        if set_server.is_ok_and(|o| o.status.success())
+            && set_enable.is_ok_and(|o| o.status.success())
+        {
+            info!("Windows system proxy enabled: {target} (will restore on exit)");
+            Some(Self { prev_server })
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+impl Drop for WindowsSystemProxyGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("reg")
+            .args([
+                "add",
+                Self::REG_KEY,
+                "/v",
+                "ProxyEnable",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                "0",
+                "/f",
+            ])
+            .output();
+        if let Some(ref prev) = self.prev_server {
+            let _ = std::process::Command::new("reg")
+                .args([
+                    "add",
+                    Self::REG_KEY,
+                    "/v",
+                    "ProxyServer",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    prev,
+                    "/f",
+                ])
+                .output();
+        }
+        info!("Windows system proxy restored");
+    }
 }
 
 /// #625: roll the committed `tun.enable` back to false after an initial

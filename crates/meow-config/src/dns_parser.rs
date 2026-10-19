@@ -67,12 +67,19 @@ pub async fn parse_dns(
     let use_hosts = dns.use_hosts.unwrap_or(true);
     let use_system_hosts = dns.use_system_hosts.unwrap_or(true);
 
-    let main_urls = parse_nameserver_entries(dns.nameserver.as_deref().unwrap_or(&[]))?;
-    let fallback_urls = parse_nameserver_entries(dns.fallback.as_deref().unwrap_or(&[]))?;
-    let default_ns_urls =
-        parse_nameserver_entries(dns.default_nameserver.as_deref().unwrap_or(&[]))?;
-    let proxy_ns_urls =
-        parse_nameserver_entries(dns.proxy_server_nameserver.as_deref().unwrap_or(&[]))?;
+    let system_ns = crate::ech_dns::system_nameservers().await;
+    let main_urls =
+        parse_nameserver_entries_with_system(dns.nameserver.as_deref().unwrap_or(&[]), &system_ns)?;
+    let fallback_urls =
+        parse_nameserver_entries_with_system(dns.fallback.as_deref().unwrap_or(&[]), &system_ns)?;
+    let default_ns_urls = parse_nameserver_entries_with_system(
+        dns.default_nameserver.as_deref().unwrap_or(&[]),
+        &system_ns,
+    )?;
+    let proxy_ns_urls = parse_nameserver_entries_with_system(
+        dns.proxy_server_nameserver.as_deref().unwrap_or(&[]),
+        &system_ns,
+    )?;
 
     let mode = match dns.enhanced_mode.as_deref() {
         Some("fake-ip") => DnsMode::FakeIp,
@@ -370,16 +377,64 @@ fn is_ip_literal_addr(addr: &str) -> bool {
     host.parse::<IpAddr>().is_ok()
 }
 
-/// Parse nameserver strings into `NameServerEntry`s — every entry must
-/// parse or load fails. No silent warn-and-drop.
+/// Match mihomo's `system` / `dhcp://system` nameserver token (with optional
+/// `#PROXY` fragment). Returns `Ok(Some(proxy))` when `s` is a system token,
+/// `Ok(None)` when `s` is a normal nameserver string, or `Err` if `#` is
+/// followed by an empty proxy name.
+fn parse_system_nameserver_token(s: &str) -> Result<Option<Option<String>>, anyhow::Error> {
+    let s = s.trim();
+    let (head, proxy) = match s.find('#') {
+        Some(idx) => {
+            let p = s[idx + 1..].trim();
+            if p.is_empty() {
+                anyhow::bail!("failed to parse nameserver '{s}': invalid host: {s}");
+            }
+            (s[..idx].trim(), Some(p.to_string()))
+        }
+        None => (s, None),
+    };
+    if head.eq_ignore_ascii_case("system") || head.eq_ignore_ascii_case("dhcp://system") {
+        Ok(Some(proxy))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Parse nameserver strings into `NameServerEntry`s, expanding `system` /
+/// `dhcp://system` into `system_ns` UDP entries. Every entry must parse or
+/// load fails.
+fn parse_nameserver_entries_with_system(
+    servers: &[String],
+    system_ns: &[SocketAddr],
+) -> Result<Vec<NameServerEntry>, anyhow::Error> {
+    let mut out = Vec::with_capacity(servers.len());
+    for s in servers {
+        if let Some(proxy) = parse_system_nameserver_token(s)? {
+            for addr in system_ns {
+                out.push(NameServerEntry {
+                    url: NameServerUrl::Udp {
+                        addr: HostOrIp::Ip(addr.ip()),
+                        port: addr.port(),
+                    },
+                    proxy: proxy.clone(),
+                });
+            }
+            continue;
+        }
+        let entry = NameServerEntry::parse(s)
+            .map_err(|e| anyhow::anyhow!("failed to parse nameserver '{s}': {e}"))?;
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
 fn parse_nameserver_entries(servers: &[String]) -> Result<Vec<NameServerEntry>, anyhow::Error> {
-    servers
-        .iter()
-        .map(|s| {
-            NameServerEntry::parse(s)
-                .map_err(|e| anyhow::anyhow!("failed to parse nameserver '{s}': {e}"))
-        })
-        .collect()
+    let fallback_sys = [
+        SocketAddr::from(([1, 1, 1, 1], 53)),
+        SocketAddr::from(([8, 8, 8, 8], 53)),
+    ];
+    parse_nameserver_entries_with_system(servers, &fallback_sys)
 }
 
 /// Pre-`NameServerEntry` shim kept for the existing tests below that build
@@ -633,43 +688,74 @@ async fn build_policy_resolvers(
     let url_strs = value.as_urls();
     let empty_resolved = HashMap::new();
     let mut resolvers = Vec::new();
+    let mut sys_ips: Option<Vec<SocketAddr>> = None;
     for url_str in &url_strs {
-        match NameServerEntry::parse(url_str) {
-            Ok(entry) => {
-                let Some(url) =
-                    resolve_policy_hostname_url(entry.url, key, url_str, bootstrap_clients).await
-                else {
-                    continue;
-                };
-                // `#PROXY` fragment: route this upstream's exchanges through
-                // the named adapter, matching the nameserver/fallback entry
-                // semantics (issue #67 phase 2, ADR-0012). An unknown name
-                // degrades to a direct dial like the main path does — under
-                // `strict` that silent downgrade is a hard error instead
-                // (issue #533 review).
-                let proxy = match entry.proxy.as_deref() {
-                    Some(name) => match proxy_registry.get(name).cloned() {
-                        Some(handle) => Some(handle),
-                        None if strict => {
-                            return Err(anyhow::anyhow!(
-                                "nameserver-policy entry '{key}': URL '{url_str}' references \
-                                 unknown proxy '{name}' (strict mode)"
-                            ));
-                        }
+        let parsed_entries: Result<Vec<NameServerEntry>, anyhow::Error> =
+            match parse_system_nameserver_token(url_str) {
+                Ok(Some(proxy_tag)) => {
+                    let ips = match &sys_ips {
+                        Some(ips) => ips,
                         None => {
-                            warn!(
-                                "nameserver-policy entry '{}': URL '{}' references unknown \
-                                proxy '{}'; dialing direct",
-                                key, url_str, name
-                            );
-                            None
+                            let discovered = crate::ech_dns::system_nameservers().await;
+                            sys_ips.insert(discovered)
                         }
-                    },
-                    None => None,
-                };
-                let resolver =
-                    Resolver::build_single_resolver_with_proxy(&url, &empty_resolved, proxy);
-                resolvers.push(resolver);
+                    };
+                    Ok(ips
+                        .iter()
+                        .map(|sa| NameServerEntry {
+                            url: NameServerUrl::Udp {
+                                addr: HostOrIp::Ip(sa.ip()),
+                                port: sa.port(),
+                            },
+                            proxy: proxy_tag.clone(),
+                        })
+                        .collect())
+                }
+                Ok(None) => NameServerEntry::parse(url_str)
+                    .map(|e| vec![e])
+                    .map_err(|e| anyhow::anyhow!("{e}")),
+                Err(e) => Err(e),
+            };
+
+        match parsed_entries {
+            Ok(entries) => {
+                for entry in entries {
+                    let Some(url) =
+                        resolve_policy_hostname_url(entry.url, key, url_str, bootstrap_clients)
+                            .await
+                    else {
+                        continue;
+                    };
+                    // `#PROXY` fragment: route this upstream's exchanges through
+                    // the named adapter, matching the nameserver/fallback entry
+                    // semantics (issue #67 phase 2, ADR-0012). An unknown name
+                    // degrades to a direct dial like the main path does — under
+                    // `strict` that silent downgrade is a hard error instead
+                    // (issue #533 review).
+                    let proxy = match entry.proxy.as_deref() {
+                        Some(name) => match proxy_registry.get(name).cloned() {
+                            Some(handle) => Some(handle),
+                            None if strict => {
+                                return Err(anyhow::anyhow!(
+                                    "nameserver-policy entry '{key}': URL '{url_str}' references \
+                                     unknown proxy '{name}' (strict mode)"
+                                ));
+                            }
+                            None => {
+                                warn!(
+                                    "nameserver-policy entry '{}': URL '{}' references unknown \
+                                    proxy '{}'; dialing direct",
+                                    key, url_str, name
+                                );
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    let resolver =
+                        Resolver::build_single_resolver_with_proxy(&url, &empty_resolved, proxy);
+                    resolvers.push(resolver);
+                }
             }
             Err(e) => {
                 if strict {
@@ -2202,5 +2288,53 @@ mod tests {
         // Unknown names are the bootstrap builder's error to raise, not ours.
         let registry = stub_registry(&[("JP", "node.example:443")]);
         assert!(circular_proxy_tags(&entries, &registry).is_empty());
+    }
+
+    #[test]
+    fn parse_system_nameserver_token_recognizes_variants() {
+        assert_eq!(parse_system_nameserver_token("system").unwrap(), Some(None));
+        assert_eq!(parse_system_nameserver_token("SYSTEM").unwrap(), Some(None));
+        assert_eq!(
+            parse_system_nameserver_token("dhcp://system").unwrap(),
+            Some(None)
+        );
+        assert_eq!(
+            parse_system_nameserver_token("system#DIRECT").unwrap(),
+            Some(Some("DIRECT".to_string()))
+        );
+        assert_eq!(
+            parse_system_nameserver_token("dhcp://system#Proxy").unwrap(),
+            Some(Some("Proxy".to_string()))
+        );
+        assert_eq!(
+            parse_system_nameserver_token("114.114.114.114").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_system_nameserver_token("https://dns.alidns.com/dns-query").unwrap(),
+            None
+        );
+        assert!(parse_system_nameserver_token("system#").is_err());
+    }
+
+    #[tokio::test]
+    async fn default_nameserver_accepts_system_keyword() {
+        // Clash Verge generates `default-nameserver: [114.114.114.114, 223.5.5.5, system]`.
+        let raw: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  default-nameserver:\n    - 114.114.114.114\n    - 223.5.5.5\n    - system\n  nameserver:\n    - 119.29.29.29\n    - system\n",
+        )
+        .unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .expect("default-nameserver with 'system' must parse cleanly");
+        assert!(cfg.enabled);
     }
 }

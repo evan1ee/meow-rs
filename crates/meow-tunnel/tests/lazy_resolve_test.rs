@@ -147,3 +147,46 @@ async fn lazy_falls_through_to_final_when_nothing_matches() {
     assert_eq!(md.dst_ip, Some(real_ip));
     assert_eq!(rule_name, "MATCH");
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[tokio::test]
+async fn lazy_skips_dns_when_process_rule_precedes_domain_and_ip_rule() {
+    use meow_rules::process::ProcessRule;
+
+    let real_ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let resolver = build_resolver_with_host("example.test", real_ip);
+    let tunnel = tunnel_with_targets(resolver, &["PROXY", "DOM", "PROC"]);
+
+    let rules: Vec<Box<dyn Rule>> = vec![
+        Box::new(ProcessRule::new("nonexistent-binary.exe", "PROC")),
+        Box::new(DomainSuffixRule::new("example.test", "DOM")),
+        Box::new(IpCidrRule::new("1.2.3.0/24", "PROXY", false, false).unwrap()),
+        Box::new(FinalRule::new("DIRECT")),
+    ];
+    tunnel.update_rules(rules);
+
+    let mut md = Metadata {
+        host: "example.test".into(),
+        src_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        src_port: 50000,
+        dst_port: 443,
+        network: Network::Tcp,
+        ..Default::default()
+    };
+    let ResolvedTarget {
+        adapter: _proxy,
+        rule_name,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
+        .inner()
+        .resolve_proxy_lazy(&mut md)
+        .await
+        .expect("rule should match");
+    assert_eq!(rule_name, "DOMAIN-SUFFIX");
+    assert!(
+        md.dst_ip.is_none(),
+        "PROCESS-NAME miss followed by DOMAIN-SUFFIX hit must not trigger DNS resolution",
+    );
+}
+

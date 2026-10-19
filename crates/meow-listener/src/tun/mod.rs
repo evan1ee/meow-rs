@@ -384,6 +384,7 @@ impl TunListener {
         if let Err(e) = &result {
             if let Some(n) = notifier.take() {
                 n.fail(e.to_string());
+                return Ok(());
             }
         }
         result
@@ -466,10 +467,14 @@ impl TunListener {
                     builder = builder.name(n);
                 }
                 // Pin the Wintun DLL we resolved above so tun-rs does not
-                // walk the process DLL search path.
+                // walk the process DLL search path. Keep `wintun_log(false)`
+                // so Wintun's internal retry loop does not spam 18 duplicate
+                // `WinTun: Failed to create private namespace` ERROR lines
+                // when started without Administrator privileges; `build_async`
+                // still surfaces the underlying OS error.
                 #[cfg(target_os = "windows")]
                 {
-                    builder = builder.wintun_file(wintun_file).wintun_log(true);
+                    builder = builder.wintun_file(wintun_file).wintun_log(false);
                 }
                 builder.build_async()
             })
@@ -484,6 +489,12 @@ impl TunListener {
                     break;
                 }
                 Ok(Err(e)) => {
+                    if e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(5) {
+                        return Err(Box::new(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!("failed to create TUN device '{display_name}': {e}"),
+                        )));
+                    }
                     warn!("failed to create TUN device '{}': {e}", display_name);
                     last_err = Some(e.to_string());
                 }

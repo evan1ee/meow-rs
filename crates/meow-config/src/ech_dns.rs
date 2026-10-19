@@ -97,7 +97,7 @@ const _: fn() = || {
 /// Unix: parse `/etc/resolv.conf` `nameserver` lines.  Other platforms (or a
 /// missing / unreadable resolv.conf) fall back to a short list of well-known
 /// public resolvers so ECH lookups still succeed in unconfigured environments.
-async fn system_nameservers() -> Vec<SocketAddr> {
+pub(crate) async fn system_nameservers() -> Vec<SocketAddr> {
     let mut out = Vec::new();
     #[cfg(unix)]
     {
@@ -115,6 +115,12 @@ async fn system_nameservers() -> Vec<SocketAddr> {
                     out.push(addr);
                 }
             }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        for ip in meow_common::outbound_iface::windows_system_dns_servers() {
+            out.push(SocketAddr::new(ip, 53));
         }
     }
     if out.is_empty() {
