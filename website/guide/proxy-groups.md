@@ -28,6 +28,8 @@ Every group type accepts these:
 | `exclude-type` | string \| list | `[]` | Exclude member proxy types, e.g. `[ss, trojan]` |
 | `include-all` | bool | `false` | Include all proxies from all providers |
 | `include-all-proxies` | bool | `false` | Include all top-level `proxies:` entries, sorted by name; excludes proxy groups and built-ins |
+| `hidden` | bool | `false` | Ask GUIs to leave the group out of their group list; reported as `hidden` in `GET /proxies`. Routing ignores it |
+| `icon` | string | `""` | An image URL, path or inline SVG for GUIs to show; reported as `icon` in `GET /proxies`. Routing ignores it |
 
 `filter` / `exclude-filter` are most useful with providers — e.g. keep only nodes whose
 name contains a region tag.
@@ -131,6 +133,7 @@ warning): `relay` runs no health-check task. A relay is static-only — provider
 `select` and `relay` do not. You can also trigger probes on demand through the REST API:
 
 - `GET /proxies/{name}/delay` — probe one proxy.
-- `GET /group/{name}/delay` — probe every member of a group.
+- `GET /group/{name}/delay` — probe every member of a group; the answer lists the
+  members that passed within the timeout, and is a 504 only when none did.
 
 See the [REST API reference](../reference/rest-api).

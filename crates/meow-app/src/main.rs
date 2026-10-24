@@ -146,7 +146,8 @@ enum ShutdownSignal {
 }
 
 impl ShutdownSignal {
-    async fn wait(self) -> Result<()> {
+    /// Wait for the stop request; names what asked.
+    async fn wait(self) -> Result<&'static str> {
         match self {
             Self::Console => {
                 #[cfg(unix)]
@@ -154,19 +155,20 @@ impl ShutdownSignal {
                     let mut sigterm =
                         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {},
-                        _ = sigterm.recv() => {},
+                        _ = tokio::signal::ctrl_c() => Ok("SIGINT"),
+                        _ = sigterm.recv() => Ok("SIGTERM"),
                     }
                 }
                 #[cfg(not(unix))]
                 {
                     tokio::signal::ctrl_c().await?;
+                    Ok("Ctrl-C")
                 }
-                Ok(())
             }
             #[cfg(target_os = "windows")]
             Self::WindowsService(receiver) => receiver
                 .await
+                .map(|()| "service stop")
                 .map_err(|_| anyhow::anyhow!("Windows service shutdown channel closed")),
         }
     }
@@ -345,6 +347,9 @@ fn run_application(
     // the Windows service host reports Stopped to SCM.
     if let Err(error) = &result {
         error!(error = %format_args!("{error:#}"), "meow-rs stopped with an error");
+        meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Failed(&format!(
+            "{error:#}"
+        )));
     }
     drop(logging);
     result
@@ -551,6 +556,11 @@ fn run_application_inner(
                 );
             }
         }
+
+        // The logbook opens once the config says whether it is wanted, so
+        // the startup's own events (a provider that fails to load) are
+        // recorded; the run is marked started once it is up.
+        meow_common::logbook::apply(meow_config::raw::RawLogbook::enabled(raw.logbook.as_ref()));
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);
@@ -1131,6 +1141,7 @@ async fn run(
     // the initial route map (issue #489).
     tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
     tunnel.set_mode(config.general.mode);
+    tunnel.set_connection_notes(config.general.connection_notes);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
     tunnel.spawn_background_tasks();
 
@@ -1174,6 +1185,9 @@ async fn run(
     let rule_provider_refresh =
         Arc::new(meow_config::rule_provider_refresh::RefreshSupervisor::default());
     rule_provider_refresh.reconcile(&rule_providers);
+    // The providers the startup build left out, recorded once now that it
+    // runs (startup builds its providers more than once).
+    config.dropped_providers.record();
 
     // Same supervision for `proxy-providers` `interval:` — reconciled
     // against the committed declarations on every registry swap
@@ -1314,7 +1328,7 @@ async fn run(
                     let socket = match tokio::net::TcpListener::bind(addr).await {
                         Ok(s) => s,
                         Err(e) => {
-                            error!("listener '{}': bind {} failed: {}", nl.name, addr, e);
+                            listener_failed(&nl.name, &format!("bind {addr} failed: {e}"));
                             continue;
                         }
                     };
@@ -1353,7 +1367,7 @@ async fn run(
                     let socket = match tokio::net::TcpListener::bind(addr).await {
                         Ok(s) => s,
                         Err(e) => {
-                            error!("listener '{}': bind {} failed: {}", nl.name, addr, e);
+                            listener_failed(&nl.name, &format!("bind {addr} failed: {e}"));
                             continue;
                         }
                     };
@@ -1376,7 +1390,7 @@ async fn run(
                     let listener = match listener.prepare(bound).await {
                         Ok(l) => l,
                         Err(e) => {
-                            error!("listener '{}': setup failed: {}", nl.name, e);
+                            listener_failed(&nl.name, &format!("setup failed: {e}"));
                             continue;
                         }
                     };
@@ -1408,7 +1422,7 @@ async fn run(
                     let socket = match tokio::net::TcpListener::bind(addr).await {
                         Ok(s) => s,
                         Err(e) => {
-                            error!("listener '{}': bind {} failed: {}", nl.name, addr, e);
+                            listener_failed(&nl.name, &format!("bind {addr} failed: {e}"));
                             continue;
                         }
                     };
@@ -1429,7 +1443,7 @@ async fn run(
                     ) {
                         Ok(l) => l.with_max_connections(nl.max_connections),
                         Err(e) => {
-                            error!("listener '{}': invalid shadowsocks config: {}", nl.name, e);
+                            listener_failed(&nl.name, &format!("invalid shadowsocks config: {e}"));
                             continue;
                         }
                     };
@@ -1439,7 +1453,7 @@ async fn run(
                     let udp_sock = match listener.bind_udp(bound).await {
                         Ok(s) => s,
                         Err(e) => {
-                            error!("listener '{}': {}", nl.name, e);
+                            listener_failed(&nl.name, &e.to_string());
                             continue;
                         }
                     };
@@ -1464,6 +1478,7 @@ async fn run(
     // Start REST API if configured. Runs after the listener bind phase so the
     // `GET /listeners` snapshot reports OS-assigned ports for `port: 0`
     // (ephemeral) listeners rather than the configured `0`.
+    let mut controller_file = None;
     if let Some(api_addr) = config.api.external_controller {
         // `external-ui-url` auto-download is gated behind the optional
         // `external-ui-download` feature (it pulls in the `zip` crate, against
@@ -1517,6 +1532,11 @@ async fn run(
         let socket = tokio::net::TcpListener::bind(api_addr)
             .await
             .map_err(|e| anyhow::anyhow!("external-controller {api_addr}: {e}"))?;
+        controller_file = publish_controller(
+            &socket,
+            config.api.secret.as_deref(),
+            config_path.as_deref(),
+        );
         tokio::spawn(async move {
             if let Err(e) = api_server.run_on(socket).await {
                 error!("API server error: {}", e);
@@ -1582,19 +1602,26 @@ async fn run(
                              check permissions / admin / CAP_NET_ADMIN"
                         );
                     }
+                    meow_api::routes::tun_failed(format!(
+                        "TUN failed to start and was turned off: {msg}"
+                    ));
                     handle.abort();
                     rollback_tun_enable(&tunnel, &raw_config).await;
                 }
                 Ok(Err(_)) => {
                     error!("TUN listener readiness signal dropped unexpectedly");
+                    meow_api::routes::tun_failed(
+                        "TUN failed to start and was turned off: the listener exited".into(),
+                    );
                     handle.abort();
                     rollback_tun_enable(&tunnel, &raw_config).await;
                 }
                 Err(_) => {
-                    error!(
-                        "TUN listener startup timed out after {} s",
-                        meow_api::TUN_STARTUP_TIMEOUT.as_secs()
-                    );
+                    let timeout = meow_api::TUN_STARTUP_TIMEOUT.as_secs();
+                    error!("TUN listener startup timed out after {timeout} s");
+                    meow_api::routes::tun_failed(format!(
+                        "TUN failed to start and was turned off: timed out after {timeout} s"
+                    ));
                     handle.abort();
                     rollback_tun_enable(&tunnel, &raw_config).await;
                 }
@@ -1614,16 +1641,21 @@ async fn run(
         None
     };
 
+    // Only now: a signal before `shutdown.wait()` installs its handler
+    // kills the process, which must not read as an unclean exit.
+    meow_common::logbook::engine_started(config_path.as_deref().unwrap_or("--config-string"));
     if let Some(on_ready) = on_ready {
         on_ready()?;
     }
     info!("meow-rs is running");
 
     // Wait for shutdown signal
-    shutdown.wait().await?;
-    info!("Shutting down...");
+    let by = shutdown.wait().await?;
+    info!("Shutting down ({by})...");
     #[cfg(feature = "listener-tun")]
     tunnel.stop_tun().await;
+    meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Requested(by));
+    drop(controller_file);
 
     Ok(())
 }
@@ -1745,6 +1777,44 @@ impl Drop for WindowsSystemProxyGuard {
         }
         info!("Windows system proxy restored");
     }
+}
+
+/// Tell `meow-cli` where this meow's API is, in a file only this user can
+/// read (`meow_common::controller_file`); it stays until the returned
+/// guard drops. Failing costs meow-cli only its lookup without options.
+fn publish_controller(
+    socket: &tokio::net::TcpListener,
+    secret: Option<&str>,
+    config_path: Option<&str>,
+) -> Option<meow_common::controller_file::Published> {
+    let published = socket.local_addr().and_then(|addr| {
+        meow_common::controller_file::publish(addr, secret, config_path.map(std::path::Path::new))
+    });
+    match published {
+        Ok(published) => published,
+        Err(e) => {
+            warn!("cannot publish the external-controller for meow-cli: {e}");
+            None
+        }
+    }
+}
+
+/// A listener that did not start: logged, recorded in the logbook, and
+/// skipped — the rest of the engine runs without it.
+#[cfg(any(
+    feature = "listener-mixed",
+    feature = "listener-tproxy",
+    feature = "listener-shadowsocks"
+))]
+fn listener_failed(name: &str, message: &str) {
+    error!("listener '{name}': {message}");
+    meow_common::logbook::event(
+        meow_common::logbook::kind::LISTENER_START,
+        meow_common::logbook::Level::Error,
+        format!("Listener '{name}' did not start: {message}"),
+    )
+    .subject(name)
+    .record();
 }
 
 /// #625: roll the committed `tun.enable` back to false after an initial

@@ -81,7 +81,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — DoT (`tls://`) | ✓ | See §DNS. |
 | `dns:` — DoQ (`quic://`) | ✗ | Deferred to M1.E-6/M2. Hard error (not silent). |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
-| `dns:` — `nameserver-policy` | ✓ | Exact, wildcard, and `geosite:` policy keys. |
+| `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. |
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
 | `dns:` — `hosts` + `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
 | `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |
@@ -438,6 +438,9 @@ $HOME/.config/meow/Country.mmdb
 ./meow/Country.mmdb
 ```
 
+The file name is matched ignoring case, so a `country.mmdb` is picked up too;
+for `IP-ASN`, an `ASN.mmdb` is used when there is no `GeoLite2-ASN.mmdb`.
+
 ### GEOSITE
 
 Supported (M1.D-2), **mrs format only**. If you have a `.dat` geosite file,
@@ -500,7 +503,7 @@ dns:
   fake-ip-filter:
     - "+.local"
     - "+.lan"
-    - "example.corp"                  # plain entry = suffix match
+    - "example.corp"                  # plain entry = exact match only
   fake-ip-filter-mode: blacklist      # default; whitelist also accepted
   store-fake-ip: true                 # optional: persist mappings across restart
 ```
@@ -509,8 +512,10 @@ dns:
   allocatable is `network + 4`. Effective capacity = `prefix_size − 4`.
   Sequential cursor, wraps on exhaustion and evicts the oldest mapping.
 - **Filter.** `BlackList` (default) routes matched hosts through the real
-  resolver; `WhiteList` does the opposite. Plain entries are treated as
-  suffixes (`example.com` matches `example.com` and any subdomain).
+  resolver; `WhiteList` does the opposite. Plain entries are exact matches
+  (`example.com` matches only `example.com` — same as upstream DomainSet
+  semantics); use `+.example.com` for apex + any-depth subdomains, `*.` for
+  exactly one label, `.` for any-depth subdomains excluding the apex.
 - **AAAA in v4-only configs.** Returns NOERROR-empty so clients fall back
   to IPv4 cleanly. To allocate v6 fake IPs, point `fake-ip-range` at an
   IPv6 prefix (e.g. `fc00::/64`).
@@ -528,12 +533,13 @@ Fully supported (M1.E-5). Wildcard entries:
 
 ```yaml
 hosts:
-  "*.corp.internal": "10.0.0.50"     # + Go syntax also accepted (see below)
-  "+.corp.internal": "10.0.0.50"     # equivalent; stored identically
+  "*.corp.internal": "10.0.0.50"     # single-label wildcard: one sub-label only
+  "+.corp.internal": "10.0.0.50"     # apex + any-depth subdomains (NOT equivalent)
 ```
 
-`*.example.com` is rewritten to `+.example.com` internally at parse time.
-Both syntaxes work in config.
+Both syntaxes work in config and are stored verbatim: `*.` matches exactly
+one subdomain label, `+.` covers the apex plus subdomains at any depth, and
+`.` covers any-depth subdomains excluding the apex.
 
 ---
 
@@ -579,6 +585,7 @@ tools built for Go mihomo will ignore them.
 | Subscription management API | `GET\|POST /api/subscriptions`, `DELETE /api/subscriptions/{name}`, `POST /api/subscriptions/{name}/refresh` | meow-rs-specific |
 | Extended proxy group API | `GET\|POST\|PUT\|DELETE /api/proxy-groups[/:name]` | meow-rs-specific |
 | Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]` | Runtime rule editing |
+| Logbook | `GET\|DELETE /logbook`, `logbook: {enable: true}` | Persistent record of notable engine events, kept 7 days in `<home>/logbook/logbook.db`; not in `minimal` builds ([ADR-0014](adr/0014-logbook.md)) |
 
 Keep these under the `/api/` prefix so they do not collide with
 Clash-compatible paths.
@@ -596,6 +603,7 @@ meow-rs uses Cargo feature flags where Go mihomo uses build tags:
 | Full app bundle | `meow-app/full` | on |
 | Minimal app bundle | `meow-app/minimal` | off |
 | AnyTLS outbound | `meow-app/anytls` (in `full`, not in `minimal`) | on |
+| Logbook (bundles SQLite) | `meow-app/logbook` (in `full`, not in `minimal`) | on |
 
 To build without encrypted DNS (smaller binary):
 
@@ -649,7 +657,11 @@ Most common format from public providers. Typical issues:
    `TPROXY`/`REDIRECT` rules.
 2. **`redir-port`** — not supported. Use `tproxy-port`.
 3. **PROCESS-NAME / PROCESS-PATH rules** — platform lookup wired (Linux netlink,
-   macOS libproc) via M1.D-1.
+   macOS libproc) via M1.D-1. Elsewhere (Android, iOS) they stay dead unless
+   the embedder's inbound names each flow's owner itself and calls
+   `meow_common::process_lookup::enable_inbound_process_info()` before the
+   first config load; an Android VPN can then match package names
+   (`PROCESS-NAME,com.example.app,…`) and app uids (`UID,10123,…`).
 4. **Firewall-management polarity is reversed.** In Go mihomo the top-level
    `iptables:` block defaults **off** (the deployer owns redirect rules
    unless they opt in); in meow-rs the equivalent `firewall:` key lives on a
@@ -760,6 +772,34 @@ The following are unsupported or intentionally rejected:
   provider group membership (invisible to the static cycle check) is
   bounded at 16 hops and fails the dial — Go's growable stacks tolerate
   unbounded recursion where Rust's fixed async frames cannot.
+
+  **Chain-aware member selection** (a meow extension; mihomo has none). A
+  `url-test`, `fallback` or `load-balance` group used as a `dialer-proxy`
+  keeps per-server verdicts for its members, because a member can pass the
+  group's URL test and still be unable to reach the chained outbound's
+  server (an airport whose audit rules drop the port). A lazy front
+  (VLESS, Trojan, Shadowsocks) returns before the remote side connects, so
+  such a member shows up only as `Connected in 0 ms` followed by EOF or a
+  broken pipe. The group now skips a member for that server once:
+  - two chains through it in a row closed before any reply byte, or
+  - the health check's chain probe (`[member, outbound]` to the group's
+    URL, run after each sweep: the group's pick first, then the fastest,
+    until 3 pass and at most 12 probes) failed through it.
+
+  The skip holds for that server only, and other traffic through the group
+  still uses its normal pick. Blocks back off from 5 minutes to 6 hours,
+  and any success clears them. With every live member blocked, the group's
+  own pick stands, and its failures count against the chained outbound.
+  When a 4th member in a row fails the same server, none reaching it in
+  between, the server is taken for the fault too: its chains count against
+  the chained outbound and block no member until one reaches it again. A
+  chained outbound that is down comes back as soon as a chain probe reaches
+  its server through any member, without waiting for the health check of
+  the group holding it. There is no config change and `select` groups are
+  untouched. Not
+  covered: UDP chains, and outbounds on the relay-based fallback wrapper
+  (`anytls`, `hysteria2`, `ss` with an external plugin), whose front hop
+  ignores the verdicts.
 
 ---
 

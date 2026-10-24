@@ -415,6 +415,324 @@ async fn get_proxy_found() {
     assert_eq!(json["name"], "DIRECT");
 }
 
+// ── provider-name and provider members on /proxies ──────────────────
+
+async fn get_json(state: &Arc<AppState>, path: &str) -> (StatusCode, serde_json::Value) {
+    let resp = create_router(Arc::clone(state))
+        .oneshot(Request::get(path).body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// Commit `config` through `PUT /configs` after writing each
+/// `(provider, payload)` to `<provider>.yaml` beside the backing config
+/// (`{dir}` in `config` expands to that directory), then wait for every
+/// provider's detached first load to publish its nodes.
+async fn state_with_file_providers(config: &str, providers: &[(&str, &str)]) -> Arc<AppState> {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let dir = std::path::Path::new(state.config_path.as_deref().unwrap())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    for (name, payload) in providers {
+        std::fs::write(dir.join(format!("{name}.yaml")), payload).unwrap();
+    }
+    let document = config.replace("{dir}", &dir.display().to_string());
+    let response = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "payload": base64::engine::general_purpose::STANDARD.encode(&document)
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    for (name, payload) in providers {
+        let expected = payload.matches("name:").count();
+        let provider = Arc::clone(state.proxy_providers.get(*name).unwrap().value());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while provider.proxies().len() < expected {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("provider {name} must publish its nodes"));
+    }
+    state
+}
+
+/// A provider file of SOCKS5 nodes named `names`, all pointing at `server`.
+/// (`type: direct` would not do: a direct node always calls itself `DIRECT`.)
+fn socks5_nodes(names: &[&str], server: std::net::SocketAddr) -> String {
+    use std::fmt::Write as _;
+    let mut yaml = String::from("proxies:\n");
+    for name in names {
+        writeln!(
+            yaml,
+            "  - {{name: {name}, type: socks5, server: {}, port: {}}}",
+            server.ip(),
+            server.port()
+        )
+        .unwrap();
+    }
+    yaml
+}
+
+/// A no-auth SOCKS5 server relaying every CONNECT, so a node pointing at it
+/// passes a real delay probe.
+async fn spawn_socks5_relay() -> std::net::SocketAddr {
+    async fn relay(mut client: tokio::net::TcpStream) -> std::io::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut greeting = [0u8; 2];
+        client.read_exact(&mut greeting).await?;
+        let mut methods = vec![0u8; usize::from(greeting[1])];
+        client.read_exact(&mut methods).await?;
+        client.write_all(&[5, 0]).await?;
+        let mut request = [0u8; 4];
+        client.read_exact(&mut request).await?;
+        let host = match request[3] {
+            1 => {
+                let mut ip = [0u8; 4];
+                client.read_exact(&mut ip).await?;
+                Ipv4Addr::from(ip).to_string()
+            }
+            3 => {
+                let mut domain = vec![0u8; usize::from(client.read_u8().await?)];
+                client.read_exact(&mut domain).await?;
+                String::from_utf8_lossy(&domain).into_owned()
+            }
+            _ => return Ok(()),
+        };
+        let port = client.read_u16().await?;
+        let mut upstream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+        client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+        Ok(())
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            tokio::spawn(relay(client));
+        }
+    });
+    addr
+}
+
+/// Nodes the tests never dial point here; nothing listens on port 1.
+const UNUSED_SERVER: std::net::SocketAddr =
+    std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+
+const AIRPORT_CONFIG: &str = "mode: rule
+proxies:
+  - {name: home, type: socks5, server: 127.0.0.1, port: 1}
+proxy-providers:
+  airport:
+    type: file
+    path: {dir}/airport.yaml
+proxy-groups:
+  - {name: PROXY, type: select, proxies: [home], use: [airport]}
+rules: ['MATCH,PROXY']
+";
+
+/// mihomo sets `provider-name` on every proxy it serializes: the provider's
+/// name on a node a proxy-provider supplied, `""` on everything else. Clash
+/// Party reads it to pick the delay route; without it every provider node
+/// went to `/proxies/{name}/delay` and showed as timed out.
+#[tokio::test]
+async fn provider_members_carry_provider_name() {
+    let nodes = socks5_nodes(&["hk-01", "jp-01"], UNUSED_SERVER);
+    let state = state_with_file_providers(AIRPORT_CONFIG, &[("airport", nodes.as_str())]).await;
+
+    let (status, all) = get_json(&state, "/providers/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, one) = get_json(&state, "/providers/proxies/airport").await;
+    assert_eq!(status, StatusCode::OK);
+    for listing in [&all["providers"]["airport"], &one] {
+        let nodes = listing["proxies"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2, "{listing}");
+        for node in nodes {
+            assert_eq!(node["provider-name"], "airport", "{node}");
+        }
+    }
+    let (status, node) = get_json(&state, "/providers/proxies/airport/hk-01").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(node["provider-name"], "airport");
+
+    // `/proxies` keeps mihomo's shape: route-table entries only, each with
+    // an empty `provider-name`; provider nodes are listed by their provider.
+    let (status, json) = get_json(&state, "/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    let proxies = json["proxies"].as_object().unwrap();
+    for name in ["home", "PROXY", "GLOBAL", "DIRECT"] {
+        assert_eq!(proxies[name]["provider-name"], "", "{name}");
+    }
+    assert!(!proxies.contains_key("hk-01"), "{json}");
+    assert_eq!(
+        proxies["PROXY"]["all"],
+        serde_json::json!(["home", "hk-01", "jp-01"])
+    );
+
+    // A provider node resolves on `/proxies/{name}` too, naming its provider.
+    let (status, node) = get_json(&state, "/proxies/hk-01").await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    assert_eq!(node["name"], "hk-01");
+    assert_eq!(node["provider-name"], "airport");
+    let (_, home) = get_json(&state, "/proxies/home").await;
+    assert_eq!(home["provider-name"], "");
+}
+
+/// `GET /proxies/{name}/delay` used to 404 for a provider node, so a client
+/// probing each member of a `use:` group there saw every provider node as
+/// down. It now probes the provider's own adapter, the same one
+/// `/providers/proxies/{provider}/{name}/healthcheck` probes.
+#[tokio::test]
+async fn provider_member_delay_resolves_through_proxies_route() {
+    let nodes = socks5_nodes(&["hk-01"], spawn_socks5_relay().await);
+    let state = state_with_file_providers(AIRPORT_CONFIG, &[("airport", nodes.as_str())]).await;
+    let origin = spawn_sub_origin("").await;
+    let url = format!("http://{origin}/generate_204");
+
+    let (status, body) = get_json(
+        &state,
+        &format!("/proxies/hk-01/delay?url={url}&timeout=5000"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["delay"].as_u64().unwrap() >= 1, "{body}");
+    let provider = Arc::clone(state.proxy_providers.get("airport").unwrap().value());
+    let node = provider
+        .proxies()
+        .into_iter()
+        .find(|proxy| proxy.name() == "hk-01")
+        .unwrap();
+    assert_eq!(
+        node.delay_history().len(),
+        1,
+        "the probe records on the provider's node"
+    );
+
+    // The route Clash Party takes once `provider-name` is set.
+    let (status, body) = get_json(
+        &state,
+        &format!("/providers/proxies/airport/hk-01/healthcheck?url={url}&timeout=5000"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(node.delay_history().len(), 2);
+
+    let (status, body) = get_json(
+        &state,
+        &format!("/proxies/nowhere/delay?url={url}&timeout=5000"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["message"], "resource not found");
+}
+
+/// Names the route table and the providers share resolve the way groups
+/// already treat them: the route-table entry wins, then providers in name
+/// order (the order `include-all` lists them in).
+#[tokio::test]
+async fn proxies_route_prefers_route_table_then_provider_name_order() {
+    let beta = socks5_nodes(&["twin", "shared"], UNUSED_SERVER);
+    let alpha = socks5_nodes(&["shared"], UNUSED_SERVER);
+    let state = state_with_file_providers(
+        "mode: rule
+proxies:
+  - {name: twin, type: socks5, server: 127.0.0.1, port: 1}
+proxy-providers:
+  beta:
+    type: file
+    path: {dir}/beta.yaml
+  alpha:
+    type: file
+    path: {dir}/alpha.yaml
+proxy-groups:
+  - {name: PROXY, type: select, proxies: [twin], use: [beta, alpha]}
+rules: ['MATCH,PROXY']
+",
+        &[("beta", beta.as_str()), ("alpha", alpha.as_str())],
+    )
+    .await;
+
+    let (status, twin) = get_json(&state, "/proxies/twin").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(twin["provider-name"], "", "the inline proxy wins");
+    let (status, shared) = get_json(&state, "/proxies/shared").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(shared["provider-name"], "alpha", "first provider by name");
+    let (status, beta) = get_json(&state, "/providers/proxies/beta/shared").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(beta["provider-name"], "beta");
+}
+
+/// mihomo reports `hidden` and `icon` on every group (`false` / `""` when
+/// unset) and on no leaf proxy. Clash Party leaves hidden groups out of its
+/// list and draws the icon on the group's header.
+#[tokio::test]
+async fn groups_report_hidden_and_icon() {
+    let raw: RawConfig = serde_yaml::from_str(
+        r#"
+mode: rule
+proxies:
+  - {name: n1, type: direct}
+  - {name: n2, type: direct}
+proxy-groups:
+  - {name: Hidden, type: select, proxies: [n1], hidden: true, icon: "https://example.com/hk.png"}
+  - {name: Auto, type: url-test, proxies: [n1, n2]}
+  - {name: Backup, type: fallback, proxies: [n1, n2], hidden: true}
+  - {name: Spread, type: load-balance, proxies: [n1, n2], icon: "<svg/>"}
+rules: ['MATCH,DIRECT']
+"#,
+    )
+    .unwrap();
+    let state = test_state(raw);
+
+    let (status, json) = get_json(&state, "/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    let proxies = &json["proxies"];
+    for (name, hidden, icon) in [
+        ("Hidden", true, "https://example.com/hk.png"),
+        ("Auto", false, ""),
+        ("Backup", true, ""),
+        ("Spread", false, "<svg/>"),
+        ("GLOBAL", false, ""),
+    ] {
+        assert_eq!(proxies[name]["hidden"], hidden, "{name}");
+        assert_eq!(proxies[name]["icon"], icon, "{name}");
+        assert_eq!(proxies[name]["provider-name"], "", "{name}");
+    }
+    for leaf in ["n1", "DIRECT"] {
+        let entry = proxies[leaf].as_object().unwrap();
+        assert!(
+            !entry.contains_key("hidden") && !entry.contains_key("icon"),
+            "{leaf}: {entry:?}"
+        );
+    }
+
+    for path in ["/proxies/Hidden", "/group/Hidden"] {
+        let (status, group) = get_json(&state, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(group["hidden"], true, "{path}");
+        assert_eq!(group["icon"], "https://example.com/hk.png", "{path}");
+    }
+}
+
 #[tokio::test]
 async fn get_configs_returns_mode() {
     let state = test_state_default();
@@ -530,6 +848,46 @@ async fn get_traffic() {
     assert_eq!(json["down"], 0);
     assert_eq!(json["upTotal"], 123);
     assert_eq!(json["downTotal"], 456);
+}
+
+/// `GET /statistics` reports the totals and each proxy's share, a closed
+/// connection's included, keyed by the leaf that carried it.
+#[tokio::test]
+async fn get_statistics_reports_traffic_per_proxy() {
+    let state = test_state_default();
+    let stats = state.tunnel.statistics();
+    let id = stats.track_connection(
+        Default::default(),
+        smol_str::SmolStr::new_static("MATCH"),
+        smol_str::SmolStr::default(),
+        smallvec![Arc::from("HK-01"), Arc::from("Proxy")],
+    );
+    let counters = stats.connection_counters(id).unwrap();
+    stats.record_upload(&counters, 10);
+    stats.record_download(&counters, 20);
+    stats.close_connection(id);
+    stats.record_packet_upload(stats.proxy_counters("DIRECT").as_deref(), 3);
+
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::get("/statistics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({
+            "uploadTotal": 13,
+            "downloadTotal": 20,
+            "proxies": {
+                "DIRECT": {"upload": 3, "download": 0},
+                "HK-01": {"upload": 10, "download": 20},
+            },
+        })
+    );
 }
 
 #[tokio::test]
@@ -2426,10 +2784,15 @@ mod delay_support {
         /// response returns the given status code. Exercises the
         /// `expected`-param path and the status-line parsing path.
         InstantStatus(u16, &'static str),
+        /// Dials to the port fail as refused; the rest succeed instantly.
+        RefusesPort(u16),
     }
 
     pub struct TestAdapter {
         name: String,
+        addr: String,
+        /// `connect_over` passes the stream through rather than refusing.
+        relays: bool,
         health: ProxyHealth,
         behavior: DialBehavior,
         pub dial_starts: Arc<Mutex<Vec<Instant>>>,
@@ -2439,10 +2802,26 @@ mod delay_support {
         pub fn new(name: &str, behavior: DialBehavior) -> Self {
             Self {
                 name: name.to_string(),
+                addr: String::new(),
+                relays: false,
                 health: ProxyHealth::new(),
                 behavior,
                 dial_starts: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// A proxy with a server at `addr`, rather than a DIRECT-like hop a
+        /// relay passes through.
+        pub fn at(mut self, addr: &str) -> Self {
+            self.addr = addr.to_string();
+            self
+        }
+
+        /// One that also runs over another proxy's stream, as a chained
+        /// outbound does.
+        pub fn relaying(mut self) -> Self {
+            self.relays = true;
+            self
         }
 
         pub fn into_proxy(self) -> Arc<dyn Proxy> {
@@ -2538,18 +2917,27 @@ mod delay_support {
             &self.name
         }
         fn adapter_type(&self) -> AdapterType {
-            AdapterType::Direct
+            if self.addr.is_empty() {
+                AdapterType::Direct
+            } else {
+                AdapterType::Http
+            }
         }
         fn addr(&self) -> &str {
-            ""
+            &self.addr
         }
         fn support_udp(&self) -> bool {
             false
         }
-        async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
             self.dial_starts.lock().unwrap().push(Instant::now());
             match &self.behavior {
-                DialBehavior::InstantOk => Ok(Box::new(CannedConn::ok())),
+                DialBehavior::RefusesPort(port) if metadata.dst_port == *port => {
+                    Err(MeowError::Proxy("connection refused".into()))
+                }
+                DialBehavior::InstantOk | DialBehavior::RefusesPort(_) => {
+                    Ok(Box::new(CannedConn::ok()))
+                }
                 DialBehavior::SleepThenOk(d) => {
                     tokio::time::sleep(*d).await;
                     Ok(Box::new(CannedConn::ok()))
@@ -2566,6 +2954,19 @@ mod delay_support {
         }
         async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
             Ok(Box::new(NopPacketConn))
+        }
+        async fn connect_over(
+            &self,
+            stream: Box<dyn ProxyConn>,
+            _metadata: &Metadata,
+        ) -> Result<Box<dyn ProxyConn>> {
+            if !self.relays {
+                return Err(MeowError::NotSupported(format!(
+                    "{}: connect_over not supported",
+                    self.name
+                )));
+            }
+            Ok(stream)
         }
         fn health(&self) -> &ProxyHealth {
             &self.health
@@ -2597,6 +2998,13 @@ mod delay_support {
         }
         async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
             self.inner.dial_udp(metadata).await
+        }
+        async fn connect_over(
+            &self,
+            stream: Box<dyn ProxyConn>,
+            metadata: &Metadata,
+        ) -> Result<Box<dyn ProxyConn>> {
+            self.inner.connect_over(stream, metadata).await
         }
         fn health(&self) -> &ProxyHealth {
             self.inner.health()
@@ -3048,6 +3456,148 @@ async fn d6_group_delay_reports_provider_slot_members() {
     );
 }
 
+/// A member whose probe fails is left out of the answer, which stays a 200
+/// as long as another member passed: a transport error and a status
+/// outside `expected` both count as failing. Their failures still land in
+/// their histories.
+#[tokio::test]
+async fn d7_group_delay_leaves_out_failed_members() {
+    let ok = TestAdapter::new("ok", DialBehavior::InstantOk).into_proxy();
+    let refused = TestAdapter::new("refused", DialBehavior::ImmediateError).into_proxy();
+    let bad_status =
+        TestAdapter::new("bad-status", DialBehavior::InstantStatus(500, "Oops")).into_proxy();
+    let group = fallback_group(
+        "G",
+        vec![
+            Arc::clone(&ok),
+            Arc::clone(&refused),
+            Arc::clone(&bad_status),
+        ],
+    );
+    let state = state_with_proxies(vec![
+        ("ok", Arc::clone(&ok)),
+        ("refused", Arc::clone(&refused)),
+        ("bad-status", Arc::clone(&bad_status)),
+        ("G", group),
+    ]);
+    let app = create_router(state);
+    let resp = delay_req(app, format!("/group/G/delay?url={}&timeout=1000", url_q())).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = body_json(resp).await;
+    let obj = body.as_object().unwrap();
+    assert_eq!(
+        obj.keys().collect::<Vec<_>>(),
+        ["ok"],
+        "only the member that passed is reported: {body}"
+    );
+    assert!(obj["ok"].as_u64().unwrap() >= 1);
+    for (label, failed) in [("refused", &refused), ("bad-status", &bad_status)] {
+        let history = failed.delay_history();
+        assert_eq!(history.len(), 1, "{label}: failure recorded");
+        assert_eq!(history[0].delay, 0, "{label}: recorded as down");
+    }
+}
+
+/// The batch shares one deadline: a member still probing when it passes is
+/// left out, and the members that passed before it are the answer.
+#[tokio::test]
+async fn d8_group_delay_at_the_deadline_reports_the_members_that_passed() {
+    let fast = TestAdapter::new(
+        "fast",
+        DialBehavior::SleepThenOk(std::time::Duration::from_millis(5)),
+    )
+    .into_proxy();
+    let slow = TestAdapter::new(
+        "slow",
+        DialBehavior::SleepThenOk(std::time::Duration::from_secs(5)),
+    )
+    .into_proxy();
+    let group = fallback_group("G", vec![Arc::clone(&fast), Arc::clone(&slow)]);
+    let state = state_with_proxies(vec![("fast", fast), ("slow", slow), ("G", group)]);
+    let app = create_router(state);
+    let start = std::time::Instant::now();
+    let resp = delay_req(app, format!("/group/G/delay?url={}&timeout=200", url_q())).await;
+    let elapsed = start.elapsed();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = body_json(resp).await;
+    let obj = body.as_object().unwrap();
+    assert_eq!(
+        obj.keys().collect::<Vec<_>>(),
+        ["fast"],
+        "the member still probing at the deadline is left out: {body}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the answer comes at the deadline, not when the slow member ends: {elapsed:?}"
+    );
+}
+
+/// No member passing is the one 504, whether the members failed outright
+/// or ran out of time, and an empty group has none that could.
+#[tokio::test]
+async fn d9_group_delay_is_504_when_no_member_passes() {
+    struct Case {
+        label: &'static str,
+        members: Vec<(&'static str, DialBehavior)>,
+        timeout_ms: u16,
+    }
+    let cases = [
+        Case {
+            label: "every member fails",
+            members: vec![
+                ("refused", DialBehavior::ImmediateError),
+                ("bad-status", DialBehavior::InstantStatus(500, "Oops")),
+            ],
+            timeout_ms: 1000,
+        },
+        Case {
+            label: "failed and timed-out members",
+            members: vec![
+                ("refused", DialBehavior::ImmediateError),
+                (
+                    "slow",
+                    DialBehavior::SleepThenOk(std::time::Duration::from_secs(5)),
+                ),
+            ],
+            timeout_ms: 100,
+        },
+        Case {
+            label: "empty group",
+            members: vec![],
+            timeout_ms: 1000,
+        },
+    ];
+    for case in cases {
+        let members: Vec<(&str, Arc<dyn Proxy>)> = case
+            .members
+            .into_iter()
+            .map(|(name, behavior)| (name, TestAdapter::new(name, behavior).into_proxy()))
+            .collect();
+        let group = fallback_group("G", members.iter().map(|(_, p)| Arc::clone(p)).collect());
+        let mut named = members;
+        named.push(("G", group));
+        let app = create_router(state_with_proxies(named));
+        let resp = delay_req(
+            app,
+            format!("/group/G/delay?url={}&timeout={}", url_q(), case.timeout_ms),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "{}: expected 504",
+            case.label
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &bytes[..],
+            br#"{"message":"Timeout"}"#,
+            "{}: unexpected body",
+            case.label
+        );
+    }
+}
+
 // ── C: auth gating on the two new endpoints ──────────────────────────
 //
 // Delay endpoints live under the gated `api` subrouter; these cases lock
@@ -3116,20 +3666,10 @@ async fn c4_get_group_delay_missing_auth_401() {
 
 // ── E: group endpoint — concurrency and timeout semantics ────────────
 //
-// Divergence note vs docs/specs/api-delay-endpoints-test-plan.md:
-// - E3 (one slow member → partial map with 0 for slow) is **not**
-//   implementable without contradicting the spec. Spec §Error cases row
-//   3 and §"Timeout semantics — group-wide" both say: any single slow
-//   member pushes the entire group probe past the deadline and the
-//   endpoint returns 504. There is no "partial results" mode. This is
-//   the upstream mihomo contract (see hub/route/groups.go::getGroupDelay
-//   — single context.WithTimeout around the whole URLTest call). QA
-//   plan's E3 wording pre-dates the final spec lock; skipping it is the
-//   correct choice here — covered instead by d4 (all-slow → 504).
-// - E4 is a duplicate of d4; not re-added.
-// Class A divergence per ADR-0002 (silent-misroute avoidance): the
-// group-wide-timeout semantic must be preserved byte-exactly so dashboards
-// relying on upstream's error shape don't quietly show stale zeros.
+// The batch shares one deadline, as in mihomo. Members that passed by
+// then make up the answer; a failed member, or one still probing, is left
+// out (no `0` entries), and the endpoint is a 504 only when none passed.
+// E3 of docs/specs/api-delay-endpoints-test-plan.md is d8; E4 is d4.
 //
 // Memory note on timing: tokio::time::pause() virtualises tokio::sleep
 // and tokio::time::timeout, but `url_test` uses std::time::Instant which
@@ -3455,10 +3995,10 @@ async fn h_series_expected_status_table() {
 }
 
 #[tokio::test]
-async fn h5_group_member_bad_status_is_zero() {
-    // Group member whose HTTP response is 500 records as 0 in the map,
-    // alongside a successful member. Matches upstream group behaviour:
-    // per-member failures are map-zero, not a top-level error.
+async fn h5_group_member_bad_status_is_left_out() {
+    // A group member whose HTTP response is 500 is missing from the map,
+    // next to a successful member: a per-member failure is neither a
+    // top-level error nor a `0` entry, as in mihomo.
     let good = TestAdapter::new("good", DialBehavior::InstantOk).into_proxy();
     let bad = TestAdapter::new("bad", DialBehavior::InstantStatus(500, "Oops")).into_proxy();
     let group = fallback_group("G", vec![Arc::clone(&good), Arc::clone(&bad)]);
@@ -3468,7 +4008,7 @@ async fn h5_group_member_bad_status_is_zero() {
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["bad"], 0);
+    assert!(body.get("bad").is_none(), "failed member left out: {body}");
     assert!(body["good"].as_u64().unwrap() >= 1);
 }
 
@@ -3498,9 +4038,309 @@ async fn h6_sleep_then_transport_error_is_503() {
     );
 }
 
+// ── Chain health: GET /proxies/{name}/chain-health ───────────────────
+
+struct ChainHealthFixture {
+    state: Arc<AppState>,
+    /// The proxies a check dials.
+    probed: Vec<Arc<dyn Proxy>>,
+    front: Arc<dyn Proxy>,
+}
+
+/// `daniel`, a chained outbound at `snell.example.com:8443`, and the front
+/// group `third-fast`: `HK` carries it, `SG` refuses its port, `JP` is
+/// down, `Auto` is a group, and `daniel` is a member too.
+fn chain_health_fixture() -> ChainHealthFixture {
+    let daniel = TestAdapter::new("daniel", DialBehavior::InstantOk)
+        .at("snell.example.com:8443")
+        .relaying()
+        .into_proxy();
+    let hk = TestAdapter::new("HK", DialBehavior::InstantOk)
+        .at("10.0.0.1:443")
+        .into_proxy();
+    let sg = TestAdapter::new("SG", DialBehavior::RefusesPort(8443))
+        .at("10.0.0.2:443")
+        .into_proxy();
+    let jp = TestAdapter::new("JP", DialBehavior::ImmediateError)
+        .at("10.0.0.3:443")
+        .into_proxy();
+    let auto = url_test_group("Auto", vec![Arc::clone(&hk)]);
+    let hy2 = TestAdapter::new("hy2", DialBehavior::InstantOk)
+        .at("hy2.example.com:8443")
+        .into_proxy();
+    let direct = TestAdapter::new("direct", DialBehavior::InstantOk).into_proxy();
+    let front = fallback_group(
+        "third-fast",
+        vec![
+            Arc::clone(&hk),
+            Arc::clone(&sg),
+            Arc::clone(&jp),
+            Arc::clone(&auto),
+            Arc::clone(&daniel),
+        ],
+    );
+    let probed = vec![Arc::clone(&daniel), Arc::clone(&hk), Arc::clone(&sg)];
+    let state = state_with_proxies(vec![
+        ("daniel", daniel),
+        ("HK", hk),
+        ("SG", sg),
+        ("JP", jp),
+        ("Auto", auto),
+        ("hy2", hy2),
+        ("direct", direct),
+        ("third-fast", Arc::clone(&front)),
+    ]);
+    ChainHealthFixture {
+        state,
+        probed,
+        front,
+    }
+}
+
+fn chain_health_path(name: &str, dialer: &str) -> String {
+    format!(
+        "/proxies/{name}/chain-health?dialer={dialer}&url={}&timeout=1000",
+        url_q()
+    )
+}
+
+/// Each member of the front group gets a verdict, in the group's order,
+/// and nothing is recorded: no delay, no chain verdict.
+#[tokio::test]
+async fn chain_health_gives_each_member_a_verdict() {
+    let ChainHealthFixture {
+        state,
+        probed,
+        front,
+    } = chain_health_fixture();
+    let app = create_router(Arc::clone(&state));
+    let resp = delay_req(app, chain_health_path("daniel", "third-fast")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = body_json(resp).await;
+    // Delays vary; each that is there must be positive.
+    for member in body["members"].as_array_mut().unwrap() {
+        for key in ["delay", "member-delay"] {
+            if let Some(delay) = member.get_mut(key) {
+                assert!(delay.as_u64().unwrap() > 0, "{key}: {delay}");
+                *delay = serde_json::json!(1);
+            }
+        }
+    }
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "proxy": "daniel",
+            "server": "snell.example.com:8443",
+            "dialer": "third-fast",
+            "members": [
+                {"name": "HK", "verdict": "reached", "delay": 1, "member-delay": 1},
+                {"name": "SG", "verdict": "failed", "member-delay": 1,
+                 "reason": "connection refused"},
+                {"name": "JP", "verdict": "down", "reason": "connection failed"},
+                {"name": "Auto", "verdict": "skipped", "reason": "a group"},
+                {"name": "daniel", "verdict": "skipped", "reason": "the proxy itself"},
+            ],
+        })
+    );
+    for proxy in probed {
+        assert!(proxy.delay_history().is_empty(), "{}", proxy.name());
+    }
+    assert!(front.chain_health().unwrap().targets().is_empty());
+}
+
+/// A single proxy serves as the dialer too.
+#[tokio::test]
+async fn chain_health_takes_a_single_proxy_as_the_dialer() {
+    let state = chain_health_fixture().state;
+    let resp = delay_req(create_router(state), chain_health_path("daniel", "SG")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["dialer"], "SG");
+    let members = body["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1);
+    // With no member reaching the server, SG's failure is not its own.
+    assert_eq!(members[0]["verdict"], "inconclusive");
+}
+
+#[tokio::test]
+async fn chain_health_refuses_what_it_cannot_probe() {
+    struct Case {
+        path: String,
+        status: StatusCode,
+        message: &'static str,
+    }
+    let case = |path: String, status, message| Case {
+        path,
+        status,
+        message,
+    };
+    let cases = [
+        case(
+            format!("/proxies/daniel/chain-health?url={}&timeout=1000", url_q()),
+            StatusCode::BAD_REQUEST,
+            "Body invalid",
+        ),
+        case(
+            "/proxies/daniel/chain-health?dialer=HK&timeout=1000".into(),
+            StatusCode::BAD_REQUEST,
+            "Body invalid",
+        ),
+        case(
+            chain_health_path("nope", "HK"),
+            StatusCode::NOT_FOUND,
+            "no proxy named 'nope'",
+        ),
+        case(
+            chain_health_path("daniel", "nope"),
+            StatusCode::NOT_FOUND,
+            "no proxy or group named 'nope'",
+        ),
+        case(
+            chain_health_path("third-fast", "HK"),
+            StatusCode::BAD_REQUEST,
+            "'third-fast' is a group; name one of its proxies",
+        ),
+        case(
+            chain_health_path("direct", "HK"),
+            StatusCode::BAD_REQUEST,
+            "'direct' has no server to dial through 'HK'",
+        ),
+        case(
+            chain_health_path("hy2", "HK"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "'hy2' cannot run over another proxy's stream, so it cannot be chained",
+        ),
+    ];
+    let state = chain_health_fixture().state;
+    let mut failures = Vec::new();
+    for case in cases {
+        let resp = delay_req(create_router(Arc::clone(&state)), case.path.clone()).await;
+        let status = resp.status();
+        let body = body_json(resp).await;
+        if status != case.status || body["message"] != case.message {
+            failures.push(format!("{}: {status} {body}", case.path));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn chain_health_needs_the_secret() {
+    let daniel = TestAdapter::new("daniel", DialBehavior::InstantOk)
+        .at("snell.example.com:8443")
+        .relaying()
+        .into_proxy();
+    let state = state_with_proxies_and_secret(vec![("daniel", daniel)], "hunter2");
+    let resp = delay_req(create_router(state), chain_health_path("daniel", "DIRECT")).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 // ── Connection management tests ──────────────────────────────────
 
 /// DELETE /connections/{id} removes the named connection and returns 204.
+/// `GET /connections/{id}` serves a connection's notes while it is live and,
+/// because notes are on, after it closes; the list keeps its shape.
+#[tokio::test]
+async fn get_connection_by_id_returns_notes_live_and_after_close() {
+    use meow_common::{ConnType, Metadata, Network};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let state = test_state_default();
+    let rule =
+        meow_rules::parse_rule("MATCH,DIRECT", &meow_rules::ParserContext::default()).unwrap();
+    state
+        .tunnel
+        .update_routing(HashMap::new(), vec![rule], Default::default());
+    state.tunnel.set_connection_notes(true);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            socket.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+    let meta = Metadata {
+        network: Network::Tcp,
+        conn_type: ConnType::Http,
+        dst_ip: Some(server.ip()),
+        dst_port: server.port(),
+        ..Default::default()
+    };
+    let (mut client, mut inbound) = tokio::io::duplex(1024);
+    let inner = Arc::clone(state.tunnel.inner());
+    let flow = tokio::spawn(async move {
+        meow_tunnel::route_inbound_tcp(&inner, &mut inbound, meta, &[]).await;
+    });
+    client.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    client.read_exact(&mut echoed).await.unwrap();
+
+    let get = |uri: String| {
+        let app = create_router(Arc::clone(&state));
+        async move {
+            app.oneshot(Request::get(uri).body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+
+    let json = body_json(get("/connections".into()).await).await;
+    let conns = json["connections"].as_array().unwrap();
+    assert_eq!(conns.len(), 1);
+    assert!(conns[0].get("notes").is_none(), "{conns:?}");
+    let id = conns[0]["id"].as_str().unwrap().to_owned();
+
+    let resp = get(format!("/connections/{id}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let live = body_json(resp).await;
+    assert_eq!(live["id"], id.as_str());
+    assert_eq!(live["closed"], false);
+    assert!(live.get("end").is_none());
+    let texts = |detail: &serde_json::Value| -> Vec<String> {
+        detail["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|note| note["text"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let notes = texts(&live);
+    assert!(
+        notes.contains(&"Matched rule #1 MATCH → DIRECT".to_owned()),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.starts_with("Connected in ")),
+        "{notes:?}"
+    );
+    assert_eq!(live["notes"][0]["kind"], "connection");
+
+    drop(client);
+    flow.await.unwrap();
+
+    let resp = get(format!("/connections/{id}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let closed = body_json(resp).await;
+    assert_eq!(closed["closed"], true);
+    assert!(closed["end"].is_string());
+    assert_eq!(closed["upload"], 4);
+    assert_eq!(closed["download"], 4);
+    let notes = texts(&closed);
+    assert_eq!(notes.last().unwrap(), "Closed: 4 B up, 4 B down");
+
+    let resp = get(format!("/connections/{}", uuid::Uuid::new_v4())).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = get("/connections/not-a-uuid".into()).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn delete_connection_by_id_returns_204_and_removes_entry() {
     use meow_common::{ConnType, Metadata, Network};
@@ -3997,6 +4837,134 @@ async fn get_connections_entry_has_camel_case_shape() {
         conn.get("rule_payload").is_none(),
         "snake_case key must not appear"
     );
+}
+
+/// `metadata.dscp` is always a number in `/connections`, as mihomo panels
+/// read it: `0` for a flow whose inbound saw no DSCP (every listener but
+/// TProxy), the value otherwise.
+#[tokio::test]
+async fn get_connections_metadata_always_carries_dscp() {
+    use meow_common::Metadata;
+    let state = test_state_default();
+    let stats = state.tunnel.statistics();
+    let track = |host: &str, dscp| {
+        stats.track_connection(
+            Metadata {
+                host: host.into(),
+                dst_port: 443,
+                dscp,
+                ..Default::default()
+            },
+            smol_str::SmolStr::new_static("MATCH"),
+            smol_str::SmolStr::default(),
+            smallvec![Arc::from("DIRECT")],
+        )
+    };
+    let unmarked = track("unmarked.example", None);
+    let marked = track("marked.example", Some(46));
+
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::get("/connections")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let dscp_of = |id: uuid::Uuid| {
+        json["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|conn| conn["id"] == id.to_string())
+            .map(|conn| conn["metadata"]["dscp"].clone())
+            .expect("connection listed")
+    };
+    assert_eq!(dscp_of(unmarked), serde_json::json!(0), "no DSCP is 0");
+    assert_eq!(dscp_of(marked), serde_json::json!(46));
+}
+
+/// `format` in `GET /providers/rules` is mihomo's name for the format a
+/// provider's rules come in (`YamlRule` / `TextRule` / `MrsRule`), which
+/// panels switch on: the declared `format:` in any case, `YamlRule` when
+/// none is declared, and `MrsRule` for an MRS payload whatever was
+/// declared, since the bytes decide how it parses.
+#[tokio::test]
+async fn rule_provider_format_uses_mihomo_names() {
+    use meow_config::raw::RawRuleProvider;
+    use meow_rules::mrs_parser::{write_ruleset_mrs, TYPE_DOMAIN};
+
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = dir.path().join("rules.yaml");
+    std::fs::write(&yaml, "payload:\n  - '+.example.com'\n").unwrap();
+    let text = dir.path().join("rules.txt");
+    std::fs::write(&text, "+.example.com\n").unwrap();
+    let mrs = dir.path().join("rules.mrs");
+    std::fs::write(
+        &mrs,
+        write_ruleset_mrs(TYPE_DOMAIN, &["example.com"]).unwrap(),
+    )
+    .unwrap();
+    let file = |path: &std::path::Path, format: Option<&str>| RawRuleProvider {
+        provider_type: "file".into(),
+        behavior: "domain".into(),
+        format: format.map(Into::into),
+        url: None,
+        path: Some(path.to_string_lossy().into_owned()),
+        interval: None,
+        proxy: None,
+        header: None,
+        payload: None,
+    };
+    let cases = [
+        ("yaml", file(&yaml, Some("yaml")), "YamlRule"),
+        ("text", file(&text, Some("text")), "TextRule"),
+        ("mrs", file(&mrs, Some("mrs")), "MrsRule"),
+        ("absent", file(&yaml, None), "YamlRule"),
+        ("upper-case", file(&text, Some("TEXT")), "TextRule"),
+        ("mixed-case", file(&mrs, Some("Mrs")), "MrsRule"),
+        ("mrs-undeclared", file(&mrs, None), "MrsRule"),
+        (
+            "inline",
+            RawRuleProvider {
+                provider_type: "inline".into(),
+                path: None,
+                payload: Some(vec!["+.example.com".into()]),
+                ..file(&yaml, None)
+            },
+            "YamlRule",
+        ),
+    ];
+    let raw: HashMap<String, RawRuleProvider> = cases
+        .iter()
+        .map(|(name, cfg, _)| ((*name).to_string(), cfg.clone()))
+        .collect();
+    let providers = meow_config::rule_provider::load_providers(
+        &raw,
+        Some(dir.path()),
+        &meow_rules::ParserContext::default(),
+        None,
+        true,
+    )
+    .expect("every provider loads");
+    let state = test_state_default();
+    *state.rule_providers.write() = providers;
+
+    let get = |uri: String| {
+        create_router(Arc::clone(&state))
+            .oneshot(Request::get(uri).body(axum::body::Body::empty()).unwrap())
+    };
+    let list = body_json(get("/providers/rules".into()).await.unwrap()).await;
+    for (name, _, expected) in &cases {
+        assert_eq!(
+            list["providers"][*name]["format"], *expected,
+            "list: {name}"
+        );
+        let one = body_json(get(format!("/providers/rules/{name}")).await.unwrap()).await;
+        assert_eq!(one["format"], *expected, "one: {name}");
+    }
 }
 
 // Exercise actual sockets: an empty statistics map alone cannot prove closure.
@@ -5835,6 +6803,266 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
     );
     assert!(state.tunnel.resolver().fake_ip_v4_net().is_some());
 }
+
+/// `PATCH /configs` with `body`, as a GUI's TUN switch sends it.
+async fn patch_configs(state: &Arc<AppState>, body: serde_json::Value) -> axum::response::Response {
+    create_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn get_configs_json(state: &Arc<AppState>) -> serde_json::Value {
+    let resp = create_router(Arc::clone(state))
+        .oneshot(
+            Request::get("/configs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+/// A GUI's TUN switch (Clash Party, zashboard, …) sends
+/// `PATCH /configs {"tun":{"enable":false}}` and never restarts the core:
+/// the patch must stop the running listener, land in the committed config
+/// and show in `GET /configs`, where those GUIs read the switch from.
+/// Deterministic under both feature sets — `stop_tun` needs no device.
+#[tokio::test]
+async fn patch_configs_tun_disable_stops_listener_and_round_trips() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    // Let the stand-in listener start: its drop flag exists only once polled.
+    tokio::task::yield_now().await;
+
+    let before = get_configs_json(&state).await;
+    assert_eq!(
+        before["tun"],
+        serde_json::json!({"enable": true, "mtu": 1500})
+    );
+    assert_eq!(before["tun-enable"], true);
+
+    // Re-sending the current state is a no-op: the listener keeps running.
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"enable": true}})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(!stopped.load(Ordering::SeqCst));
+    assert!(state.tunnel.has_tun());
+
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"enable": false}})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "disabling TUN must reap the running listener"
+    );
+    assert!(!state.tunnel.has_tun());
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert!(!tun.enable, "the committed config must say TUN is off");
+    assert_eq!(tun.mtu, Some(1500), "keys the patch omits are kept");
+
+    let after = get_configs_json(&state).await;
+    assert_eq!(
+        after["tun"],
+        serde_json::json!({"enable": false, "mtu": 1500})
+    );
+    assert_eq!(after["tun-enable"], false);
+}
+
+/// Without the `listener-tun` feature a `tun` patch turning TUN on fails
+/// the way `PUT /configs` does — `enable` rolls back, the other patched
+/// keys stay — but the PATCH answers with an error instead of 204, since
+/// the TUN change was the request. Mode is not applied either.
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
+    let state = test_state(test_raw_config());
+    assert_eq!(
+        get_configs_json(&state).await["tun"],
+        serde_json::json!({"enable": false}),
+        "no tun: section still reports the switch"
+    );
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"mode": "direct", "tun": {"enable": true, "mtu": 1400}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let message = body_json(resp).await["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.contains("listener-tun"),
+        "the error must say why TUN did not start: {message}"
+    );
+    assert!(!state.tunnel.has_tun());
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert!(!tun.enable, "a failed start must roll `enable` back");
+    assert_eq!(tun.mtu, Some(1400));
+    let configs = get_configs_json(&state).await;
+    assert_eq!(configs["tun"]["enable"], false);
+    assert_eq!(
+        configs["mode"], "rule",
+        "a failed TUN patch must not apply the rest of the body"
+    );
+}
+
+/// A patch without `enable` keeps the current state, so a parameter change
+/// under a running listener restarts it like a `PUT /configs` `tun:` diff;
+/// without the feature the respawn fails, which rolls `enable` back and
+/// fails the PATCH.
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn patch_configs_tun_param_change_restarts_running_listener() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    // Let the stand-in listener start: its drop flag exists only once polled.
+    tokio::task::yield_now().await;
+
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"mtu": 9000}})).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the restart must reap the old listener handle"
+    );
+    assert!(!state.tunnel.has_tun());
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert!(!tun.enable);
+    assert_eq!(tun.mtu, Some(9000));
+}
+
+/// Keys are merged over the committed section: a key the patch omits, or
+/// sends as `null`, keeps its value.
+#[tokio::test]
+async fn patch_configs_tun_merges_over_committed_section() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(
+        serde_yaml::from_str("enable: false\ndevice: utun9\nmtu: 1500\ndns-hijack: [any:53]")
+            .unwrap(),
+    );
+    let state = test_state(raw);
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"tun": {"mtu": 1400, "device": null, "auto-route": "global"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert!(!tun.enable, "an omitted `enable` keeps TUN off");
+    assert_eq!(tun.device.as_deref(), Some("utun9"));
+    assert_eq!(tun.mtu, Some(1400));
+    assert_eq!(tun.dns_hijack, Some(vec!["any:53".to_string()]));
+    assert_eq!(
+        get_configs_json(&state).await["tun"],
+        serde_json::json!({
+            "enable": false,
+            "device": "utun9",
+            "mtu": 1400,
+            "auto-route": "global",
+            "dns-hijack": ["any:53"],
+        })
+    );
+}
+
+/// Unknown keys — mihomo's upstream-only `tun` keys and other top-level
+/// sections (Clash Party sends `dns` with its TUN switch) — are ignored,
+/// not stored and not rejected.
+#[tokio::test]
+async fn patch_configs_tun_ignores_unknown_keys() {
+    let state = test_state(test_raw_config());
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({
+            "tun": {
+                "enable": false,
+                "device": "utun9",
+                "stack": "gvisor",
+                "strict-route": true,
+                "auto-detect-interface": true,
+                "not-a-key": 1,
+            },
+            "dns": {"enable": true},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert_eq!(tun.device.as_deref(), Some("utun9"));
+    assert!(tun.stack.is_none());
+    assert!(tun.strict_route.is_none());
+    assert!(tun.auto_detect_interface.is_none());
+    assert!(state.raw_config.read().dns.is_none());
+}
+
+/// A patch without `tun` leaves the section and the running listener
+/// alone.
+#[tokio::test]
+async fn patch_configs_without_tun_leaves_tun_untouched() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let before = state.raw_config.read().tun.clone();
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    // Let the stand-in listener start: its drop flag exists only once polled.
+    tokio::task::yield_now().await;
+
+    let resp = patch_configs(&state, serde_json::json!({"mode": "direct"})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(state.raw_config.read().tun, before);
+    assert!(!stopped.load(Ordering::SeqCst));
+    assert!(state.tunnel.has_tun());
+    assert_eq!(get_configs_json(&state).await["mode"], "direct");
+}
+
+/// A `tun` section the listener cannot parse is rejected before anything
+/// is applied, like a `PUT /configs` one: the running listener, the
+/// committed section and the rest of the body stay as they were.
+#[tokio::test]
+async fn patch_configs_tun_rejects_invalid_section() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let before = state.raw_config.read().tun.clone();
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    // Let the stand-in listener start: its drop flag exists only once polled.
+    tokio::task::yield_now().await;
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"mode": "direct", "tun": {"mtu": 1000}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let message = body_json(resp).await["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("tun.mtu"), "{message}");
+    assert_eq!(state.raw_config.read().tun, before);
+    assert!(!stopped.load(Ordering::SeqCst));
+    assert!(state.tunnel.has_tun());
+    assert_eq!(get_configs_json(&state).await["mode"], "rule");
+}
+
 /// A newly declared provider whose origin never answers must not hold the
 /// `CONFIG_MUTATION` lane. The commit lands on its own, the initial fetch
 /// runs detached, and the next writer is not queued behind a blackholed
@@ -5902,4 +7130,364 @@ async fn put_configs_does_not_await_provider_downloads_in_the_mutation_lane() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     server.abort();
+}
+
+/// `GET /logbook` and `DELETE /logbook`. The logbook is process-global and
+/// other tests in this binary may record into it while it is installed, so
+/// every read filters on this test's subject.
+#[tokio::test]
+async fn logbook_lists_filters_and_clears_entries() {
+    use meow_common::logbook;
+
+    let state = test_state_default();
+    let app = create_router(Arc::clone(&state));
+    let get = |uri: &str| {
+        let app = app.clone();
+        let request = Request::get(uri).body(axum::body::Body::empty()).unwrap();
+        async move { app.oneshot(request).await.unwrap() }
+    };
+
+    let off = body_json(get("/logbook").await).await;
+    assert_eq!(off["enabled"], false);
+    assert_eq!(off["entries"], serde_json::json!([]));
+
+    let dir = tempfile::tempdir().unwrap();
+    logbook::install(dir.path(), logbook::Options::default()).unwrap();
+
+    // An API mutation records itself once committed.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/proxy-groups")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"name":"LogbookGroup","type":"select","proxies":["DIRECT"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    for message in ["first", "second"] {
+        logbook::event(
+            logbook::kind::PROXY_PROVIDER_UPDATE,
+            logbook::Level::Warning,
+            message,
+        )
+        .subject("LogbookGroup")
+        .coalesce()
+        .record();
+    }
+
+    let page = body_json(get("/logbook?subject=LogbookGroup").await).await;
+    assert_eq!(page["enabled"], true);
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{page}");
+    assert_eq!(entries[0]["kind"], "proxy-provider.update");
+    assert_eq!(entries[0]["message"], "second", "the fold keeps the latest");
+    assert_eq!(entries[0]["count"], 2);
+    assert_eq!(entries[1]["kind"], "config.change");
+    assert_eq!(entries[1]["message"], "Created proxy group 'LogbookGroup'");
+
+    let warnings = body_json(get("/logbook?subject=LogbookGroup&level=warning").await).await;
+    assert_eq!(warnings["entries"].as_array().unwrap().len(), 1);
+    let area = body_json(get("/logbook?subject=LogbookGroup&kind=config").await).await;
+    assert_eq!(area["entries"][0]["kind"], "config.change");
+    let paged = body_json(get("/logbook?subject=LogbookGroup&limit=1").await).await;
+    assert_eq!(paged["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(paged["more"], true);
+
+    let bad = get("/logbook?level=loud").await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::delete("/logbook")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let cleared = body_json(get("/logbook?subject=LogbookGroup").await).await;
+    assert_eq!(cleared["entries"], serde_json::json!([]));
+    let marker = body_json(get("/logbook?kind=logbook.cleared").await).await;
+    assert_eq!(marker["entries"].as_array().unwrap().len(), 1);
+
+    logbook::uninstall();
+    assert_eq!(body_json(get("/logbook").await).await["enabled"], false);
+}
+
+// ── Proxy-provider subscriptionInfo ──────────────────────────────
+
+/// What [`UserinfoOrigin`] answers every request with.
+#[derive(Clone, Copy)]
+struct OriginReply {
+    status: u16,
+    /// The `subscription-userinfo` header value, sent when `Some`.
+    userinfo: Option<&'static str>,
+    body: &'static str,
+}
+
+const USERINFO_PAYLOAD: &str = "proxies:\n  - {name: n1, type: direct}\n";
+
+/// A proxy-provider origin the test steers: counts requests and answers
+/// each with the current [`OriginReply`].
+struct UserinfoOrigin {
+    url: String,
+    reply: Arc<parking_lot::Mutex<OriginReply>>,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl UserinfoOrigin {
+    async fn spawn(reply: OriginReply) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/sub.yaml", listener.local_addr().unwrap());
+        let reply = Arc::new(parking_lot::Mutex::new(reply));
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (task_reply, task_hits) = (Arc::clone(&reply), Arc::clone(&hits));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                task_hits.fetch_add(1, Ordering::SeqCst);
+                let reply = *task_reply.lock();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    // Mixed case on purpose: the header name is
+                    // case-insensitive.
+                    let userinfo = reply
+                        .userinfo
+                        .map(|value| format!("Subscription-Userinfo: {value}\r\n"))
+                        .unwrap_or_default();
+                    let response = format!(
+                        "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n{userinfo}\r\n{}",
+                        reply.status,
+                        reply.body.len(),
+                        reply.body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        Self { url, reply, hits }
+    }
+
+    fn set(&self, reply: OriginReply) {
+        *self.reply.lock() = reply;
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+/// Load `providers` (name → YAML declaration) the way startup does, with
+/// `dir` as the provider cache directory, and serve them from a fresh
+/// [`AppState`].
+async fn state_with_providers(
+    providers: &[(&str, String)],
+    dir: &std::path::Path,
+) -> Arc<AppState> {
+    let raw: HashMap<String, meow_config::raw::RawProxyProvider> = providers
+        .iter()
+        .map(|(name, yaml)| ((*name).to_string(), serde_yaml::from_str(yaml).unwrap()))
+        .collect();
+    let loaded = meow_config::proxy_provider::load_proxy_providers_within(
+        &raw,
+        Some(dir),
+        false,
+        false,
+        &Default::default(),
+        None,
+        &mut meow_config::DroppedProviders::default(),
+    )
+    .await
+    .unwrap();
+    let state = test_state_default();
+    for (name, provider) in loaded {
+        state.proxy_providers.insert(name, provider);
+    }
+    state
+}
+
+async fn api_call(state: &Arc<AppState>, method: &str, uri: &str) -> axum::response::Response {
+    create_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// `subscriptionInfo` of provider `name` as `GET /providers/proxies` lists
+/// it, checked against `GET /providers/proxies/{name}`; `None` when absent.
+async fn listed_subscription_info(state: &Arc<AppState>, name: &str) -> Option<serde_json::Value> {
+    let list = body_json(api_call(state, "GET", "/providers/proxies").await).await;
+    let one = api_call(state, "GET", &format!("/providers/proxies/{name}")).await;
+    assert_eq!(one.status(), StatusCode::OK);
+    let one = body_json(one).await;
+    assert_eq!(list["providers"][name], one, "list and detail agree");
+    assert_eq!(
+        one["proxies"].as_array().map(Vec::len),
+        Some(1),
+        "the payload loaded: {one}"
+    );
+    one.as_object().unwrap().get("subscriptionInfo").cloned()
+}
+
+/// An HTTP provider whose response carries `subscription-userinfo` reports
+/// it as mihomo's `subscriptionInfo`; one without the header, and a `file`
+/// provider, leave the field out.
+#[tokio::test]
+async fn proxy_providers_report_subscription_userinfo() {
+    let with = UserinfoOrigin::spawn(OriginReply {
+        status: 200,
+        userinfo: Some("upload=1234; download=5678; total=1073741824; expire=1700000000"),
+        body: USERINFO_PAYLOAD,
+    })
+    .await;
+    let without = UserinfoOrigin::spawn(OriginReply {
+        status: 200,
+        userinfo: None,
+        body: USERINFO_PAYLOAD,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("local.yaml"), USERINFO_PAYLOAD).unwrap();
+    let state = state_with_providers(
+        &[
+            ("usage", format!("type: http\nurl: {}\n", with.url)),
+            ("plain", format!("type: http\nurl: {}\n", without.url)),
+            ("local", "type: file\npath: local.yaml\n".to_string()),
+        ],
+        dir.path(),
+    )
+    .await;
+
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(serde_json::json!({
+            "Upload": 1234,
+            "Download": 5678,
+            "Total": 1_073_741_824_u64,
+            "Expire": 1_700_000_000_u64,
+        }))
+    );
+    assert_eq!(listed_subscription_info(&state, "plain").await, None);
+    assert_eq!(listed_subscription_info(&state, "local").await, None);
+}
+
+/// The usage is persisted next to the provider cache, so a restart that
+/// serves the cache without touching the network reports it at once; each
+/// later fetch the provider accepts replaces it, even when the payload is
+/// unchanged, a failed fetch keeps it, and a fetch without the header
+/// clears it.
+#[tokio::test]
+async fn proxy_provider_subscription_info_survives_restart_and_follows_fetches() {
+    let origin = UserinfoOrigin::spawn(OriginReply {
+        status: 200,
+        userinfo: Some("upload=1; download=2; total=1000"),
+        body: USERINFO_PAYLOAD,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let decl = [("usage", format!("type: http\nurl: {}\n", origin.url))];
+    let sidecar = dir.path().join("provider_usage.yaml.subscription-userinfo");
+    let first = serde_json::json!({"Upload": 1, "Download": 2, "Total": 1000, "Expire": 0});
+
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(first.clone())
+    );
+    assert!(sidecar.exists(), "persisted next to the cache");
+    drop(state);
+
+    // Restart with the feed down: the cache and its usage are served
+    // before (and without) any request.
+    origin.set(OriginReply {
+        status: 503,
+        userinfo: None,
+        body: "",
+    });
+    let hits = origin.hits();
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(
+        origin.hits(),
+        hits,
+        "a cached provider starts without a fetch"
+    );
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(first.clone())
+    );
+
+    // The usage moved; the payload did not.
+    origin.set(OriginReply {
+        status: 200,
+        userinfo: Some("upload=10; download=20; total=1000; expire=1800000000"),
+        body: USERINFO_PAYLOAD,
+    });
+    let refreshed = api_call(&state, "PUT", "/providers/proxies/usage").await;
+    assert_eq!(refreshed.status(), StatusCode::NO_CONTENT);
+    let second = serde_json::json!({"Upload": 10, "Download": 20, "Total": 1000, "Expire": 1_800_000_000_u64});
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(second.clone())
+    );
+
+    origin.set(OriginReply {
+        status: 503,
+        userinfo: Some("upload=99; download=99; total=99"),
+        body: "",
+    });
+    let failed = api_call(&state, "PUT", "/providers/proxies/usage").await;
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(second.clone()),
+        "a failed fetch keeps the last accepted usage"
+    );
+
+    // A restart now reports the refetched usage, not the first one.
+    drop(state);
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(second)
+    );
+
+    origin.set(OriginReply {
+        status: 200,
+        userinfo: None,
+        body: USERINFO_PAYLOAD,
+    });
+    let cleared = api_call(&state, "PUT", "/providers/proxies/usage").await;
+    assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+    assert_eq!(listed_subscription_info(&state, "usage").await, None);
+    assert!(!sidecar.exists(), "nothing left to restore");
+    drop(state);
+
+    origin.set(OriginReply {
+        status: 503,
+        userinfo: None,
+        body: "",
+    });
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(listed_subscription_info(&state, "usage").await, None);
 }

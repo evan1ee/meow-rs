@@ -7,6 +7,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RecordType};
 use ipnet::IpNet;
+use meow_common::conn_note;
 use meow_common::DnsMode;
 use meow_trie::DomainTrie;
 use smol_str::SmolStr;
@@ -111,7 +112,9 @@ struct MatcherPolicyEntry {
     entry: PolicyEntry,
 }
 
-/// Per-domain nameserver routing: exact matches and `+.` wildcard prefixes.
+/// Per-domain nameserver routing: exact (bare) keys in `exact`, `+.`, `*.`
+/// and `.` prefixed keys in the `wildcard` trie, geosite/rule-set closures
+/// in `matchers`. `lookup` consults them in that order.
 pub struct NameserverPolicy {
     exact: HashMap<String, PolicyEntry>,
     wildcard: DomainTrie<PolicyEntry>,
@@ -156,16 +159,14 @@ impl NameserverPolicy {
         &self.clients
     }
 
-    /// Insert a `+.` wildcard pattern. Also inserts an exact match for the root
-    /// domain since `DomainTrie`'s `+.` semantics don't include the root itself.
+    /// Insert a wildcard-pattern policy key verbatim into the `DomainTrie`:
+    /// `+.x` covers the apex plus any-depth subdomains, `*.x` exactly one
+    /// label, `.x` any-depth subdomains excluding the apex — upstream
+    /// `parseNameServerPolicy` routes all three through one `domainTriePolicy`.
+    /// `+.` natively covers the root domain, so no supplementary exact-map
+    /// entry is needed for any prefix kind.
     pub fn insert_wildcard(&mut self, pattern: &str, entry: PolicyEntry) {
         self.track_clients(&entry);
-        // Insert root domain explicitly: DomainTrie's +. doesn't match root.
-        if let Some(bare) = pattern.strip_prefix("+.") {
-            self.exact
-                .entry(bare.to_string())
-                .or_insert_with(|| entry.clone());
-        }
         self.wildcard.insert(pattern, entry);
     }
 
@@ -503,6 +504,7 @@ async fn query_pool_set(
     if clients.is_empty() {
         return (None, None);
     }
+    let started = tokio::time::Instant::now();
     let mut pending = FuturesUnordered::new();
     for client in clients {
         pending.push(async move {
@@ -544,14 +546,33 @@ async fn query_pool_set(
                     %error,
                     "DNS upstream query failed"
                 );
+                conn_note!(
+                    Dns,
+                    "{} failed for {host} after {} ms: {error}",
+                    client.upstream_label(),
+                    started.elapsed().as_millis()
+                );
                 upstream_err = prefer_errno(upstream_err, Some(error));
                 continue;
             }
         };
         if set.has_positive() {
+            conn_note!(
+                Dns,
+                "{} answered {host} → {} in {} ms",
+                client.upstream_label(),
+                IpList(&set.positive_ips()),
+                started.elapsed().as_millis()
+            );
             // A positive answer always wins, regardless of grace state.
             return (Some(set), upstream_err);
         }
+        conn_note!(
+            Dns,
+            "{} has no address for {host} ({} ms)",
+            client.upstream_label(),
+            started.elapsed().as_millis()
+        );
         let definitive = set.is_definitive_negative(want);
         if negative.is_none() {
             // First negative — definitive or partial. Don't return yet: a
@@ -575,6 +596,25 @@ async fn query_pool_set(
         }
     }
     (negative, upstream_err)
+}
+
+/// At most four addresses, then a count of the rest, for connection notes.
+struct IpList<'a>(&'a [IpAddr]);
+
+impl std::fmt::Display for IpList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const SHOWN: usize = 4;
+        for (i, ip) in self.0.iter().take(SHOWN).enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{ip}")?;
+        }
+        if self.0.len() > SHOWN {
+            write!(f, " (+{} more)", self.0.len() - SHOWN)?;
+        }
+        Ok(())
+    }
 }
 
 /// Fold a tier chain's raw `(set, error)` outcome into the caller-facing
@@ -1116,6 +1156,7 @@ impl Resolver {
                     // still reach a host that the hosts file only pins for the
                     // other family.
                     if let Some(enabled) = self.filter_enabled_ips(ips) {
+                        conn_note!(Dns, "hosts: {host} → {}", IpList(&enabled));
                         return Ok(Some(enabled));
                     }
                     host
@@ -1189,6 +1230,9 @@ impl Resolver {
         // (not re-queried) with the freshly queried ones.
         if let Some(cached) = self.cache.get_lookup(lookup_host) {
             if let Some(enabled) = self.filter_enabled_ips(&cached.ips) {
+                if want.is_empty() {
+                    conn_note!(Dns, "Cached: {lookup_host} → {}", IpList(&enabled));
+                }
                 return Ok(Some(enabled));
             }
             // No usable IPs. If every required family is now fresh (cached or
@@ -1583,6 +1627,7 @@ impl Resolver {
             if let Some(entry) = inflight.get(host) {
                 let mut rx = entry.subscribe();
                 drop(entry);
+                conn_note!(Dns, "Waiting for a lookup of {host} already in flight");
                 match rx.recv().await {
                     Ok(result) => return result.map_err(|e| e.to_io()),
                     // A capacity-1 channel can only close *empty* when the
@@ -1603,6 +1648,7 @@ impl Resolver {
                 Entry::Occupied(existing) => {
                     let mut rx = existing.get().subscribe();
                     drop(existing);
+                    conn_note!(Dns, "Waiting for a lookup of {host} already in flight");
                     match rx.recv().await {
                         Ok(result) => return result.map_err(|e| e.to_io()),
                         // Same dead-publisher case as above (#682).
@@ -1647,6 +1693,7 @@ impl Resolver {
         // Domain-gate: skip primary entirely, go straight to fallback.
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(host) {
+                conn_note!(Dns, "fallback-filter sends {host} to the fallback servers");
                 return self.query_fallback_set(host, want).await;
             }
         }
@@ -1661,6 +1708,7 @@ impl Resolver {
         // Nameserver-policy lookup.
         if let Some(policy) = &self.policy {
             if let Some(entry) = policy.lookup(host) {
+                conn_note!(Dns, "nameserver-policy matched {host}");
                 let (set, err) = query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
                 upstream_err = prefer_errno(upstream_err, err);
                 if let Some(set) = set {
@@ -1670,6 +1718,11 @@ impl Resolver {
                             .as_ref()
                             .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
                         {
+                            conn_note!(
+                                Dns,
+                                "fallback-filter rejects {}; asking the fallback servers",
+                                IpList(&set.positive_ips())
+                            );
                             let (set, err) = self.query_fallback_set(host, want).await;
                             return (set, prefer_errno(err, upstream_err));
                         }
@@ -1694,6 +1747,11 @@ impl Resolver {
                         .as_ref()
                         .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
                     {
+                        conn_note!(
+                            Dns,
+                            "fallback-filter rejects {}; asking the fallback servers",
+                            IpList(&set.positive_ips())
+                        );
                         let (set, err) = self.query_fallback_set(host, want).await;
                         return (set, prefer_errno(err, upstream_err));
                     }
@@ -2834,6 +2892,39 @@ mod tests {
         ));
     }
 
+    /// A connection that records notes sees which upstream answered, and
+    /// then that the answer came from the cache.
+    #[tokio::test]
+    async fn connection_notes_record_upstream_answers_and_cache_hits() {
+        use meow_common::conn_notes::ConnNotes;
+        let upstream =
+            one_shot_a_upstream(ResponseCode::NoError, Some(Ipv4Addr::new(192, 0, 2, 7))).await;
+        let resolver = Resolver::new(
+            vec![upstream],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            false,
+        );
+        let notes = ConnNotes::new();
+        for _ in 0..2 {
+            let ip = ConnNotes::scope(Some(notes.clone()), resolver.resolve_ip("notes.example"))
+                .await
+                .unwrap();
+            assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))));
+        }
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(
+            texts[0].starts_with(&format!(
+                "{upstream} answered notes.example → 192.0.2.7 in "
+            )),
+            "{texts:?}"
+        );
+        assert_eq!(texts[1], "Cached: notes.example → 192.0.2.7");
+    }
+
     #[tokio::test]
     async fn resolve_ip_returns_cached_entry() {
         let hosts: DomainTrie<HostEntry> = DomainTrie::new();
@@ -3649,10 +3740,110 @@ mod tests {
             "subdomain must match"
         );
         assert!(
+            pol.lookup("a.b.corp.internal").is_some(),
+            "deep subdomain must match (+. covers any depth)"
+        );
+        assert!(
             pol.lookup("corp.internal").is_some(),
             "root domain must match (+. includes root)"
         );
         assert!(pol.lookup("other.example").is_none(), "non-match must miss");
+    }
+
+    // nameserver-policy exact-first precedence: an exact entry beats a `+.`
+    // wildcard at the apex regardless of insertion order (lookup consults the
+    // exact map before the wildcard trie).
+    #[test]
+    fn nameserver_policy_exact_overrides_wildcard_at_apex() {
+        for exact_first in [true, false] {
+            let wildcard_entry = PolicyEntry {
+                nameservers: vec![],
+            };
+            let exact_entry = PolicyEntry {
+                nameservers: vec![],
+            };
+            let mut pol = NameserverPolicy::new();
+            if exact_first {
+                pol.insert_exact("corp.internal".to_string(), exact_entry);
+                pol.insert_wildcard("+.corp.internal", wildcard_entry);
+            } else {
+                pol.insert_wildcard("+.corp.internal", wildcard_entry);
+                pol.insert_exact("corp.internal".to_string(), exact_entry);
+            }
+            // Pointer identity pins the provenance: the apex hit must be the
+            // exact-map slot, not the wildcard trie's.
+            let hit = pol.lookup("corp.internal").expect("apex must match");
+            assert!(
+                std::ptr::eq(hit, pol.exact.get("corp.internal").unwrap()),
+                "exact entry must win over +. wildcard at the apex (exact_first={exact_first})"
+            );
+            assert!(
+                pol.lookup("x.corp.internal").is_some(),
+                "subdomain must still resolve via the wildcard (exact_first={exact_first})"
+            );
+        }
+    }
+
+    // `*.`/`.` keys reach the trie verbatim via insert_wildcard; an exact
+    // entry still wins at every level (exact map is consulted first).
+    #[test]
+    fn nameserver_policy_star_and_dot_wildcards() {
+        let mut pol = NameserverPolicy::new();
+        pol.insert_wildcard(
+            "*.corp.internal",
+            PolicyEntry {
+                nameservers: vec![],
+            },
+        );
+        pol.insert_wildcard(
+            ".eng.internal",
+            PolicyEntry {
+                nameservers: vec![],
+            },
+        );
+        assert!(pol.lookup("a.corp.internal").is_some());
+        assert!(pol.lookup("corp.internal").is_none());
+        assert!(pol.lookup("a.b.corp.internal").is_none());
+        assert!(pol.lookup("a.eng.internal").is_some());
+        assert!(pol.lookup("a.b.eng.internal").is_some());
+        assert!(pol.lookup("eng.internal").is_none());
+
+        // exact beats a `*.` wildcard at depth 1, order-independent.
+        for exact_first in [true, false] {
+            let mut p = NameserverPolicy::new();
+            if exact_first {
+                p.insert_exact(
+                    "a.corp.internal".to_string(),
+                    PolicyEntry {
+                        nameservers: vec![],
+                    },
+                );
+                p.insert_wildcard(
+                    "*.corp.internal",
+                    PolicyEntry {
+                        nameservers: vec![],
+                    },
+                );
+            } else {
+                p.insert_wildcard(
+                    "*.corp.internal",
+                    PolicyEntry {
+                        nameservers: vec![],
+                    },
+                );
+                p.insert_exact(
+                    "a.corp.internal".to_string(),
+                    PolicyEntry {
+                        nameservers: vec![],
+                    },
+                );
+            }
+            let hit = p.lookup("a.corp.internal").expect("depth-1 hit");
+            assert!(
+                std::ptr::eq(hit, p.exact.get("a.corp.internal").unwrap()),
+                "exact entry must win over *. wildcard (exact_first={exact_first})"
+            );
+        }
     }
 
     #[test]

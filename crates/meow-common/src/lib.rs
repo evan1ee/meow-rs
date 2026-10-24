@@ -18,12 +18,16 @@ pub mod adapter_type;
 pub mod atomic;
 pub mod auth;
 pub mod backoff;
+pub mod chain_health;
 pub mod conn;
+pub mod conn_notes;
+pub mod controller_file;
 pub mod dial;
 pub mod dns_mode;
 pub mod error;
 pub mod fs_util;
 pub mod home_dir;
+pub mod logbook;
 pub mod metadata;
 pub mod network;
 pub mod outbound_iface;
@@ -32,15 +36,20 @@ pub mod replay_window;
 pub mod rule;
 pub mod sniffer;
 pub mod socket_protect;
+pub mod traffic;
 pub mod tunnel_mode;
 
 pub use adapter::{
-    reset_sessions_reachable, DelayHistory, ProviderSlot, Proxy, ProxyAdapter, ProxyHealth,
-    ProxySelection, ProxyState,
+    reset_sessions_reachable, DelayHistory, GroupDisplay, ProviderSlot, Proxy, ProxyAdapter,
+    ProxyHealth, ProxySelection, ProxyState,
 };
 pub use adapter_type::{AdapterType, ConnType};
 pub use auth::{AuthConfig, Credentials};
 pub use backoff::ErrorBackoff;
+pub use chain_health::{
+    failure_reason, Blame, CarrierChange, ChainHealth, ChainTarget, ChainVerdict,
+    CLOSED_BEFORE_REPLY,
+};
 pub use conn::{ProxyConn, ProxyPacketConn, UdpPacket};
 pub use dial::{with_dial_timeout, DIAL_TIMEOUT};
 pub use dns_mode::DnsMode;
@@ -66,6 +75,7 @@ pub use socket_protect::{clear_host_resolver, host_resolver, set_host_resolver, 
 pub use socket_protect::{
     clear_socket_protector, set_socket_protector, socket_protector, SocketProtector,
 };
+pub use traffic::{ProxyTraffic, ProxyTrafficSource};
 pub use tunnel_mode::TunnelMode;
 
 pub mod health_check;

@@ -19,6 +19,10 @@ cargo build --release
 # Test config validity
 ./target/release/meow -f config.yaml -t
 
+# Control the running meow over its REST API (`meow-cli --help`); it finds
+# the meow running as this user through the file meow publishes at startup
+./target/release/meow-cli status
+
 # Run all unit tests
 cargo test --lib
 
@@ -60,7 +64,7 @@ Listeners (HTTP/SOCKS5/Mixed/TProxy/TUN)
 
 ### Workspace Crates
 
-The workspace has 14 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md) for crate-boundary policy):
+The workspace has 15 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md) for crate-boundary policy):
 
 | Crate | Purpose |
 |-------|---------|
@@ -77,6 +81,7 @@ The workspace has 14 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md)
 | `meow-config` | YAML configuration parsing into typed structs |
 | `meow-api` | REST API server (Axum) for proxies, rules, connections, configs, traffic, DNS query |
 | `meow-app` | CLI entry point (`main.rs`) — wires config → tunnel → listeners → DNS → API → health checks → subscription refresh |
+| `meow-cli` | `meow-cli` binary: controls a running meow over its REST API (plain HTTP client; of the engine crates it links only `meow-common`, for `controller_file`, the 0600 file meow writes once its `external-controller` is bound and meow-cli reads to find it with no options); ships its agent skill at `skills/meow-cli/SKILL.md`, which the desktop release archives carry as `skills/meow-cli/` (`desktop: true` in `build.yml`). Unpublished: the crates.io name belongs to an unrelated crate |
 | `meow-bench` | Standalone benchmark binary (throughput, latency, connection-rate, DNS, memory, binary-size, config-reload, idle/steady footprint, proxied-outbound via sing-box) |
 
 ### Startup Flow
@@ -99,6 +104,7 @@ The `tun:` config section (issue #326, feature `listener-tun`, in the `full` bun
 - **`Rule` trait** (`meow-common/src/rule.rs`) — all rule types implement this for matching against `Metadata`
 - **Proxy groups** (`meow-proxy/src/group/`) — Selector, URLTest, Fallback wrap multiple adapters with selection strategies
 - **Tunnel** (`meow-tunnel/src/tunnel.rs`) — central `Arc`-shared routing engine; holds proxies, rules, DNS resolver, connection stats
+- **Logbook** (`meow-common/src/logbook/`) — persistent record of notable engine events (`GET /logbook`), an SQLite database behind the `logbook` feature (`rusqlite`, bundled except on iOS/tvOS, which link the system libsqlite3; in `full`, not `minimal`, where `disabled.rs` stands in); producers call `logbook::event(kind, level, message).subject(..).record()`, a no-op when none is installed. New kinds go in `logbook::kind` and the [ADR-0014](docs/adr/0014-logbook.md) table; never record traffic destinations, and reference rules by index
 
 ### Adding New Proxy Protocols
 
@@ -140,6 +146,10 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
+# `minimal` leaves out `logbook`, which every run above unifies on; its
+# stub (`logbook/disabled.rs`) only compiles here.
+cargo clippy -p meow-common --all-targets -- -D warnings
+cargo test -p meow-common --lib logbook
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test -p meow-listener --all-features --lib udp_port_53
 # `listener-shadowsocks` is opt-in: the default-features suite never compiles
@@ -176,11 +186,11 @@ cargo test -p meow-config --features trusttunnel-h3 --lib
 # alone is not enough: it skips every `--test` target, so a broken integration
 # test (e.g. the ADR-0001 guard in `crate_invariants_test`) passes locally and
 # lands `main` red.
-cargo test --lib --bin meow --bin meow-bench \
+cargo test --lib --bin meow --bin meow-bench --bin meow-cli \
   --test socks5_udp_user \
   --test common_test --test dns_cache_test --test config_test \
   --test tun_config_test --test dialer_proxy_group \
-  --test statistics_test --test rules_test --test api_test \
+  --test statistics_test --test rules_test --test api_test --test meow_cli_test \
   --test raii_guard_test --test http_connection_close \
   --test config_persistence_test --test systemd_config_test \
   --test launchd_config_test \
@@ -314,3 +324,4 @@ See [docs/benchmarks/index.md](docs/benchmarks/index.md) for a collated table of
 - **DNS**: `hickory-resolver`/`hickory-server`/`hickory-proto`
 - **Web framework**: axum + tower
 - **GeoIP**: `maxminddb`
+- **Logbook storage**: `rusqlite` with `bundled` (SQLite compiled in) on every target but iOS/tvOS, which link the system libsqlite3 to spare the size-capped Network Extension (embedders pass `-lsqlite3`); optional behind meow-common's `logbook` feature; `minimal` leaves it out (ADR-0007)

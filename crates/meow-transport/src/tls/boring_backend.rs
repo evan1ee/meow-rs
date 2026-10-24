@@ -578,7 +578,10 @@ impl BoringInner {
             // Warned about once per proxy in `TlsLayer::new`.
             b.set_verify(boring::ssl::SslVerifyMode::NONE);
         } else {
-            b.set_verify(boring::ssl::SslVerifyMode::PEER);
+            b.set_verify_callback(
+                boring::ssl::SslVerifyMode::PEER,
+                super::distrust::verify_callback,
+            );
             // Mozilla CA bundle (plus any `additional_roots`) as the verify
             // store, rebuilt per distinct connector cache key from the shared,
             // pre-parsed root certs. `set_cert_store_builder` hands over the
@@ -1571,5 +1574,40 @@ mod tests {
         let chain = chain_of(vec![leaf, inter, root]);
         pinned_chain_decision(&chain, &pin, "srv.example.com")
             .expect("pinning the root at depth 2 must verify leaf via the intermediate");
+    }
+
+    /// Roots pulled from the Mozilla store after a CA compromise, by the
+    /// SHA-256 of their DER. meow never consults the OS store, so the
+    /// `webpki-root-certs` floor in the workspace `Cargo.toml` is the only
+    /// thing that drops them; this keeps a loosened floor from quietly
+    /// trusting one again.
+    const DISTRUSTED_ROOTS: &[(&str, &str)] = &[
+        // eMudhra intermediate key compromise (Mozilla bug 2083449): the
+        // EM DV/OV/EV TLS CA - G3B/G3C keys are recoverable from the
+        // certificates, and they chain here through emSign Root TLS CA - G3.
+        (
+            "emSign ECC Root CA - G3",
+            "86A1ECBA089C4A8D3BBE2734C612BA341D813E043CF9E8A862CD5C57A36BBE6B",
+        ),
+    ];
+
+    #[test]
+    fn distrusted_roots_stay_out_of_the_store() {
+        let roots: Vec<[u8; 32]> = boring_roots().iter().map(sha256).collect();
+        assert!(
+            !roots.is_empty(),
+            "the Mozilla root store must not be empty"
+        );
+        for (name, hex) in DISTRUSTED_ROOTS {
+            let mut fp = [0u8; 32];
+            for (i, byte) in fp.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+            }
+            assert!(
+                !roots.contains(&fp),
+                "{name} is distrusted but still in webpki-root-certs; \
+                 raise the workspace floor"
+            );
+        }
     }
 }

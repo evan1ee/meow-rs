@@ -38,11 +38,62 @@ static files instead.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/proxies` | All proxies and groups |
-| `GET` | `/proxies/{name}` | One proxy/group (name, type, alive, history, udp, `all`, `now`) |
+| `GET` | `/proxies` | All proxies and groups (provider nodes are listed under `/providers/proxies`) |
+| `GET` | `/proxies/{name}` | One proxy/group (name, type, alive, history, udp, `provider-name`; groups add `all`, `now`, `hidden`, `icon`); also finds a provider node |
 | `PUT` | `/proxies/{name}` | Select a member in a group — body `{ "name": "member" }` → 204 |
-| `GET` | `/proxies/{name}/delay` | Probe delay — query `url`, `timeout`, `expected` |
-| `GET` | `/group/{name}/delay` | Probe every member of a group |
+| `GET` | `/proxies/{name}/delay` | Probe delay — query `url`, `timeout`, `expected`; also probes a provider node |
+| `GET` | `/group/{name}/delay` | Probe every member of a group — same query; `{ "member": delay }` for the members that passed within `timeout`, 504 when none did |
+| `GET` | `/proxies/{name}/chain-health` | Probe a proxy chained through each member of `dialer` (a group, or one proxy) — query `dialer`, `url`, `timeout`, `expected`; see [Chain health](#chain-health) |
+
+Every proxy object carries `provider-name`: the name of the proxy-provider
+that supplied the node, or `""` for `proxies:` entries, groups and the
+built-ins. Every group object carries `hidden` and `icon`, the group's
+`hidden:` / `icon:` keys (`false` / `""` when unset); GUIs use them to leave a
+group out of their list and to draw its icon.
+
+`GET /proxies` lists the route table, as mihomo does, so the nodes a
+proxy-provider supplies appear there only by name, in their groups' `all`.
+`GET /proxies/{name}` and `GET /proxies/{name}/delay` still resolve such a
+node (mihomo returns 404 there). When a name is both a `proxies:` entry and
+a provider node, the `proxies:` entry wins; when two providers supply it,
+the first provider by name wins. `/providers/proxies/{provider}/{name}`
+reaches each of them.
+
+### Chain health
+
+`GET /proxies/{name}/chain-health?dialer=Airport&url=…&timeout=5000`
+dials proxy `name` through each member of `dialer`, the way `dialer-proxy`
+chains it, whether or not `name` sets one, and probes each member alone
+too, 16 members at a time. It records nothing: no delay, no chain verdict,
+no logbook entry. The answer keeps the group's order:
+
+```json
+{
+  "proxy": "home",
+  "server": "snell.example.com:8443",
+  "dialer": "Airport",
+  "members": [
+    { "name": "HK 01", "verdict": "reached", "delay": 182, "member-delay": 95 },
+    { "name": "SG 01", "verdict": "failed", "member-delay": 88, "reason": "closed before any reply" },
+    { "name": "JP 01", "verdict": "down", "reason": "timed out" },
+    { "name": "Auto", "verdict": "skipped", "reason": "a group" }
+  ]
+}
+```
+
+| Verdict | Meaning |
+| --- | --- |
+| `reached` | The chain through the member reached `url`: `delay`, and `member-delay` when the member alone did too |
+| `failed` | The member reached `url` alone and another member carried the chain, but this one did not: it blocks the proxy's server |
+| `inconclusive` | The member reached `url` alone but not through the chain, and no member carried it: the proxy's own server is the likelier fault |
+| `down` | The member failed alone too, so it says nothing about the chain |
+| `skipped` | Not probed: a group, or the proxy itself |
+
+`reason` is the failure: the chain's for `failed` and `inconclusive`, the
+member's own for `down`. 400 for a missing `dialer`, `url` or `timeout`, a
+group, or a proxy with no server (`DIRECT`); 404 for an unknown proxy or
+dialer; 422 for a proxy that cannot run over another proxy's stream, like
+hysteria2, found once a member reaches its server. TCP only.
 
 ## Rules
 
@@ -58,7 +109,7 @@ static files instead.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/connections` | Snapshot: totals + per-connection `src`/`dst`/`chains`/`rule`/`upload`/`download`/`start` |
+| `GET` | `/connections` | Snapshot: totals + per-connection `metadata`/`chains`/`rule`/`upload`/`download`/`start` (`metadata.dscp` is `0` when the inbound saw none) |
 | `DELETE` | `/connections` | Close all connections → 204 |
 | `DELETE` | `/connections/{id}` | Close one connection by UUID → 204 |
 
@@ -66,10 +117,22 @@ static files instead.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/configs` | Current `mode`, `log-level`, ports, controller |
-| `PATCH` | `/configs` | Update `mode` and/or `log-level` → 204 |
+| `GET` | `/configs` | Current `mode`, `log-level`, ports, controller, `tun` |
+| `PATCH` | `/configs` | Update `mode`, `log-level` and/or `tun` → 204 (below) |
 | `PUT` | `/configs` | Hot-reload the whole config (below) |
 | `POST` | `/api/config/save` | Persist the current config to disk (400 when the daemon was started via `--config-string` — there is no backing file) |
+
+`PATCH /configs` with `{ "tun": { "enable": true } }` turns TUN on without a restart,
+as a mihomo GUI's TUN switch expects. The `tun` keys (`enable`, `device`, `mtu`,
+`inet4-address`, `inet6-address`, `auto-route`, `outbound-interface`, `dns-hijack`,
+`udp-timeout`) are merged over the current `tun:` section, so an omitted key, `enable`
+included, keeps its value; other keys are ignored. The listener is then started, stopped
+or restarted the way a `PUT /configs` `tun:` change does it. A section the listener
+cannot parse returns 400 and applies nothing; a TUN that fails to start (no permission to
+create the device, or a build without the `listener-tun` feature) is turned off again and
+the PATCH returns 500 `{ message }`. `GET /configs` reports `tun`, where `enable` is
+whether the listener runs. Like `mode`, the change lives in memory until the config is
+saved.
 
 `PUT /configs` accepts `{ "path": "/path/to/config.yaml" }` or
 `{ "payload": "<base64-yaml>" }`. Add `?force=true` to apply despite validation errors
@@ -102,9 +165,27 @@ bookkeeping fields does not orphan the subscription's tracked content.
 | `GET` | `/providers/proxies/{name}` | One proxy provider |
 | `PUT` | `/providers/proxies/{name}` | Refresh (re-fetch) → 204 |
 | `GET` | `/providers/proxies/{name}/healthcheck` | Health-check all proxies in it |
-| `GET` | `/providers/rules` | List rule providers |
+| `GET` | `/providers/proxies/{provider}/{proxy}` | One node of a proxy provider |
+| `GET` | `/providers/proxies/{provider}/{proxy}/healthcheck` | Probe one provider node's delay — query `url`, `timeout`, `expected` |
+| `GET` | `/providers/rules` | List rule providers (`format` is `YamlRule`, `TextRule` or `MrsRule`) |
 | `GET` | `/providers/rules/{name}` | One rule provider |
 | `PUT` | `/providers/rules/{name}` | Refresh a rule provider |
+
+An `http` proxy provider whose server sends a `subscription-userinfo`
+response header (`upload=…; download=…; total=…; expire=…`) carries the
+plan usage as `subscriptionInfo` in `GET /providers/proxies[/{name}]`, the
+way mihomo reports it:
+
+```json
+{ "subscriptionInfo": { "Upload": 1234, "Download": 5678, "Total": 1073741824, "Expire": 1700000000 } }
+```
+
+Bytes, and Unix seconds for `Expire`; a key the header leaves out reads 0
+(an `Expire` of 0 is a plan without an end date). The last fetch the
+provider accepted decides: one without the header drops the field, a failed
+one keeps it. The usage is kept next to the provider cache, in
+`<path>.subscription-userinfo`, so a restart that starts from the cache
+reports it before the first refetch. `file` providers have none.
 
 ## Proxy groups
 

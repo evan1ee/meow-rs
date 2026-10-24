@@ -1,6 +1,6 @@
 # TUN inbound — transparent proxy on Windows (and everywhere else)
 
-Last updated: 2026-10-02. Tracks the `listener-tun` feature (issue
+Last updated: 2026-10-19. Tracks the `listener-tun` feature (issue
 [#326](https://github.com/madeye/meow-rs/issues/326)).
 Audience: users who want system-wide transparent proxying on a platform
 without a tproxy/REDIRECT firewall — Windows first and foremost. The same
@@ -60,6 +60,34 @@ Then:
 3. Start meow. DNS queries route into the tun (the range is on-link/routed),
    `dns-hijack` answers them with fake IPs, connections to those fake IPs
    route into the tun, and rules match on the recovered domain.
+
+## Windows: address setup, adapter reuse, and conflicts
+
+On Windows the adapter's addresses do not go through the OS's
+duplicate-address detection: meow turns that check off on its own adapter
+and creates each configured address ready to use, so traffic and DNS work
+the moment the TUN listener reports ready. Without it a fresh address
+stays *tentative* while the OS checks it for duplicates, and a tentative
+address cannot send packets. Three consequences of how that is done:
+
+- **A reused adapter is reconfigured.** An adapter left behind by an
+  unclean shutdown carries its previous run's addresses; meow logs a
+  warning, opens it — or recreates it, when the driver has orphaned the
+  leftover — and assigns exactly the configured addresses, replacing
+  every non-link-local one it finds, IPv6 included. Stale IPv6 addresses
+  are removed even when no `inet6-address` is configured: the adapter
+  ends up with exactly what the config says. An adapter that outlives
+  meow also keeps duplicate-address detection off.
+- **A conflicted address fails loudly, then rotates.** An address another
+  adapter still holds fails the attempt instead of starting the device
+  half-configured; each retry gets a new adapter name, and from the third
+  attempt the address of both families also rotates — IPv4 steps a few
+  addresses up from the configured one, IPv6 cycles through the addresses
+  of its subnet.
+- **A failed attempt rolls the adapter back.** The failed attempt removes
+  an address it managed to add and restores the ones it replaced — the
+  adapter is left as it was found — and the listener moves on to the
+  next one.
 
 ## How v1 stays loop-free (and what it doesn't capture)
 
@@ -395,7 +423,7 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | Field | Default | Notes |
 |-------|---------|-------|
 | `enable` | `false` | Master switch. Requires a build with the `listener-tun` feature (included in `full`). |
-| `device` | platform-chosen | Adapter name. macOS always auto-assigns `utunN`. |
+| `device` | platform-chosen | Adapter name. macOS always auto-assigns `utunN`. On Windows a same-named leftover adapter is reopened — or recreated, when the driver has orphaned it — and reconfigured either way (see *Windows: address setup, adapter reuse, and conflicts*). |
 | `mtu` | `1500` | Hard error below 1280 (userspace-stack minimum). |
 | `inet4-address` | `172.19.0.1/30` | CIDR assigned to the device. |
 | `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured with `auto-route: global`, where it also adds the IPv6 split default routes (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
@@ -422,6 +450,14 @@ The PUT still returns 204 — the failure is logged, not surfaced. The
 one case where an unchanged re-PUT does *not* retry is a listener that
 dies *after* a successful start (no rollback ran, committed stays
 `true`); revival there needs an `enable` flip or a parameter change.
+
+`PATCH /configs` with a `tun` object, which is what a mihomo GUI's TUN
+switch sends, runs the same reconcile. The keys it carries are merged
+over the committed section: an omitted key, `enable` included, keeps its
+value, the fields of the table above apply and any other key is ignored.
+A section that fails to parse is rejected with 400 and nothing applied;
+a failed (re)start rolls `enable` back as above, but the PATCH answers
+500 with the reason instead of 204.
 
 In global route mode a reload binds outbound sockets before its first dial,
 exactly like startup (#695). A `PUT /configs` whose candidate has

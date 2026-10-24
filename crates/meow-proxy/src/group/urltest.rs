@@ -2,8 +2,9 @@ use super::selector_store::SelectorStore;
 use super::{DialFailureTracker, UsageTracker};
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, DelayHistory, MeowError, Metadata, ProviderSlot, Proxy, ProxyAdapter, ProxyConn,
-    ProxyHealth, ProxyPacketConn, ProxySelection, Result,
+    AdapterType, ChainHealth, ChainTarget, DelayHistory, GroupDisplay, MeowError, Metadata,
+    ProviderSlot, Proxy, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, ProxySelection,
+    Result,
 };
 use parking_lot::RwLock;
 use smol_str::SmolStr;
@@ -25,8 +26,10 @@ pub struct UrlTestGroup {
     /// promotes a new best.
     fastest: RwLock<Option<SmolStr>>,
     health: ProxyHealth,
+    display: GroupDisplay,
     usage: UsageTracker,
     dial_failures: DialFailureTracker,
+    chain_health: Arc<ChainHealth>,
 }
 
 impl UrlTestGroup {
@@ -42,8 +45,10 @@ impl UrlTestGroup {
             expected_status: String::new(),
             fastest: RwLock::new(None),
             health: ProxyHealth::new(),
+            display: GroupDisplay::default(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
+            chain_health: Arc::new(ChainHealth::tracking_carriers()),
         }
     }
 
@@ -64,8 +69,10 @@ impl UrlTestGroup {
             expected_status: String::new(),
             fastest: RwLock::new(None),
             health: ProxyHealth::new(),
+            display: GroupDisplay::default(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
+            chain_health: Arc::new(ChainHealth::tracking_carriers()),
         }
     }
 
@@ -84,6 +91,14 @@ impl UrlTestGroup {
             }
             self.store = Some(store);
         }
+        self
+    }
+
+    /// Attach the group's `hidden:` / `icon:` keys, which `GET /proxies`
+    /// reports on the group.
+    #[must_use]
+    pub fn with_display(mut self, display: GroupDisplay) -> Self {
+        self.display = display;
         self
     }
 
@@ -181,6 +196,56 @@ impl UrlTestGroup {
             return fb;
         }
         current_proxy.or(best_proxy).or(first_any)
+    }
+
+    /// [`Self::pick_for_dial`], or for a `dialer-proxy` front hop the
+    /// fastest member not blocked for its target. The incumbent `fastest`
+    /// stays as it is: the swap holds for that target only.
+    fn pick_for(
+        &self,
+        metadata: &Metadata,
+        dial: bool,
+    ) -> Option<(Arc<dyn Proxy>, Option<ChainTarget>)> {
+        let pick = self.pick_for_dial()?;
+        let Some(target) = super::front_hop_target(&self.chain_health, metadata, dial) else {
+            return Some((pick, None));
+        };
+        let carrier = self.carrier_for(&target);
+        let pick = super::front_hop_pick(
+            &self.name,
+            &self.chain_health,
+            &target,
+            pick,
+            carrier,
+            || {
+                let mut members = self.member_proxy_list();
+                // Fastest first; an unprobed member (delay 0) last.
+                members.sort_by_key(|p| match p.last_delay() {
+                    0 => u16::MAX,
+                    d => d,
+                });
+                members
+            },
+            |p| p.alive(),
+            dial,
+        );
+        Some((pick, Some(target)))
+    }
+
+    /// The member carrying the chains to `target`, unless a member the user
+    /// fixed is in force.
+    fn carrier_for(&self, target: &ChainTarget) -> Option<Arc<dyn Proxy>> {
+        if self.fixed_proxy_if_alive().is_some() {
+            return None;
+        }
+        let name = self.chain_health.carrier(target)?;
+        if let Some(p) = self.static_proxies.iter().find(|p| p.name() == name) {
+            return Some(Arc::clone(p));
+        }
+        self.provider_slots.iter().find_map(|slot| {
+            let guard = slot.read();
+            guard.iter().find(|p| p.name() == name).map(Arc::clone)
+        })
     }
 
     /// Read-only lookup of whatever `fastest` currently points at — used by
@@ -281,11 +346,20 @@ impl ProxyAdapter for UrlTestGroup {
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         self.usage.touch_user_traffic(metadata);
-        let proxy = self
-            .pick_for_dial()
+        let (proxy, front_hop) = self
+            .pick_for(metadata, true)
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
+        if let Some(target) = &front_hop {
+            super::note_front_hop_member(&self.chain_health, target, &proxy);
+        }
         let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
-        attempt.finish(proxy.dial_tcp(metadata).await)
+        let conn = attempt.run(proxy.dial_tcp(metadata)).await?;
+        Ok(match front_hop {
+            Some(target) => {
+                super::watch_front_hop(conn, &self.name, &self.chain_health, target, &proxy)
+            }
+            None => conn,
+        })
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -294,7 +368,7 @@ impl ProxyAdapter for UrlTestGroup {
             .pick_for_dial()
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
         let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
-        attempt.finish(proxy.dial_udp(metadata).await)
+        attempt.run(proxy.dial_udp(metadata)).await
     }
 
     fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
@@ -304,7 +378,7 @@ impl ProxyAdapter for UrlTestGroup {
         // upstream `Unwrap` → `fast(touch)`: `touch` gates only usage
         // recording — the recompute and the `fastest` update happen on
         // peeks too, so the probe can never disagree with the next dial.
-        self.pick_for_dial()
+        self.pick_for(metadata, false).map(|(pick, _)| pick)
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -362,8 +436,16 @@ impl Proxy for UrlTestGroup {
         Some(&self.expected_status)
     }
 
+    fn group_display(&self) -> Option<&GroupDisplay> {
+        Some(&self.display)
+    }
+
     fn usage_generation(&self) -> u64 {
         self.usage.generation()
+    }
+
+    fn chain_health(&self) -> Option<&Arc<ChainHealth>> {
+        Some(&self.chain_health)
     }
 }
 

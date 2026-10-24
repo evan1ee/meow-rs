@@ -22,6 +22,417 @@ the canonical, in-repo source a release is cut from.
   all run through it.
 - **shadow-tls on relay-chain hops**: SS and Snell shadow-tls nodes now run
   the handshake over a relay-supplied stream instead of refusing it.
+- **`meow-cli`, a command-line controller for a running meow**: a second
+  binary, shipped beside `meow` in the desktop release archives (Windows,
+  macOS, Linux glibc and musl on x86_64 and aarch64), that drives the
+  REST API from a shell or a script. It shows status, switches the mode,
+  log level and TUN, lists groups and switches, pins or unpins their
+  members, delay-tests groups and proxies, lists rules, lists, inspects and
+  closes connections, queries and flushes DNS, updates providers and
+  subscriptions, reads the logbook, follows the log and traffic, and
+  reloads a config file. On the machine meow runs on, as the same user, it
+  needs no options: once its `external-controller` is up, meow writes the
+  address and the API secret to a file only that user can read, and
+  removes it on exit, so meow-cli also finds a meow that a desktop GUI
+  started with the secret on its command line. `--controller` and
+  `--config` name another address, and that meow's file still supplies the
+  secret when it bound exactly that address; `MEOW_SECRET` and
+  `--secret-stdin` override it. There is no secret flag, so the secret
+  never lands in shell history. A meow running as root
+  publishes in `/var/run/meow`, for root; the systemd unit `meow install`
+  writes now creates that directory (`RuntimeDirectory=meow`).
+  `--json` prints the API's answers for scripts. The same archives carry
+  an agent skill in `skills/meow-cli/`, in the Agent Skills format, that
+  teaches a coding agent to use it, including which commands change state;
+  `meow-cli skill` prints its `SKILL.md`. The crate is not published on crates.io,
+  where the name belongs to an unrelated crate.
+- **Chain health checks for `dialer-proxy` chains**: `meow-cli chain-health
+  <proxy> <dialer>` and `GET /proxies/{name}/chain-health?dialer=…` dial a
+  proxy through each member of a group, the way `dialer-proxy` chains it,
+  whether or not its config sets one, and probe each member alone too. A
+  member that works on its own but cannot carry the proxy, like an airport
+  node that blocks the proxy's server, reads `failed`, apart from members
+  that are `down`; `reached` gives the chain's delay. When no member carries
+  the proxy, the members that work alone read `inconclusive`, as the
+  proxy's own server is the likelier fault. Groups and the proxy itself are
+  `skipped`. The check records nothing: no delay, no chain verdict, no
+  logbook entry. `--json` prints each member's verdict for scripts that
+  prune a front group. A proxy that cannot run over another proxy's
+  stream, like hysteria2, is refused (422).
+
+### Changed
+
+- **The logbook links the system SQLite on iOS and tvOS**: with the
+  `logbook` feature, meow-common compiled its own SQLite (about 1 MiB) into
+  every build. iOS and tvOS ship libsqlite3, and there the engine runs in a
+  Network Extension with a binary size cap, so on those targets it now
+  links the system library instead. An iOS or tvOS embedder that enables
+  `logbook` adds `-lsqlite3` to its app's link. Every other target still
+  bundles SQLite.
+- **Domain patterns follow mihomo's semantics everywhere** (#795): `x.com`
+  matches only `x.com`, `*.x.com` exactly one label below it, `.x.com`
+  subdomains at any depth but not `x.com`, and `+.x.com` both `x.com` and
+  every subdomain. Some existing configs now match fewer names:
+  - a plain `fake-ip-filter` entry such as `example.com` no longer covers
+    its subdomains; write `+.example.com` for the old behavior;
+  - `*.foo` in `hosts` and `fallback-filter.domain` matches one label only,
+    no longer `foo` itself or deeper names (it was rewritten to `+.foo`);
+  - a `.x.com` entry in an upstream `.mrs` domain rule-set no longer
+    matches `x.com`.
+
+  Others now match what they always should have: `nameserver-policy` keys
+  starting with `*.` or `.` take effect (they silently never matched
+  before), `+.` covers the apex in sniffer `force-domain` / `skip-domain`,
+  and non-ASCII entries in `.mrs` domain rule-sets load instead of being
+  dropped.
+
+### Security
+
+- **Distrust the compromised eMudhra intermediates by key**: every
+  chain-verifying TLS client (`TlsLayer` for TLS proxies, DoH/DoT,
+  subscriptions and rule/geodata fetches; the hysteria2 and TrustTunnel
+  QUIC configs; restls) now rejects a chain containing any of the eight
+  eMudhra "G3B" / "G3C" intermediate keys whose private keys can be
+  recovered from the certificates (Mozilla bug 2083449), with
+  `X509_V_ERR_CERT_REVOKED`. 0.26.0 removed their browser-trusted root,
+  emSign ECC Root CA - G3; this also closes the paths that root removal
+  does not, such as a `ca` / `ca-str` bundle that still carries that root
+  or Sectigo's AAA Certificate Services (which cross-signed the same keys).
+  meow checks no OCSP, CRLs or CT, so this list plays the role of Firefox's
+  OneCRL and Chrome's CRLSets. Matching is on the SubjectPublicKeyInfo, so
+  cross-signs and re-issues of those keys are covered. A pinned certificate
+  `fingerprint` still replaces CA validation and is not filtered.
+
+## [0.26.1] - 2026-10-21
+
+### Changed
+
+- **Dependency refresh**: `Cargo.lock` re-resolved to the latest
+  semver-compatible versions of its dependencies, so release binaries
+  pick up upstream bug and security fixes. Held back: `boring` /
+  `boring-sys` / `tokio-boring` at 5.2.0 (5.3 deprecates the AEAD in-place
+  API the VMess, VLESS-encryption and Snell ciphers use), `shadowsocks` at
+  1.24.0 (1.25 needs rustc 1.91 and pulls in a second crypto library,
+  aws-lc), and `h2` at 0.4.18 (0.4.19 breaks TrustTunnel's empty-frame
+  handling on reused sessions).
+
+## [0.26.0] - 2026-10-21
+
+### Added
+
+- **`PATCH /configs` turns TUN on and off without a restart**: a mihomo
+  GUI's TUN switch, Clash Party's for one, sends
+  `PATCH /configs {"tun": {"enable": true}}` and never restarts the core,
+  but the PATCH only took `mode` and `log-level`, so the switch did nothing
+  and still answered 204. A `tun` object is now merged over the committed
+  `tun:` section and the listener is started, stopped or restarted from the
+  result, the same way `PUT /configs` applies a `tun:` change, matching
+  mihomo. It takes the keys meow implements (`enable`, `device`, `mtu`,
+  `inet4-address`, `inet6-address`, `auto-route`, `outbound-interface`,
+  `dns-hijack`, `udp-timeout`) and ignores the others, such as `stack` and
+  `strict-route`; unlike mihomo, an omitted `enable` keeps the current state
+  rather than turning TUN off. A section the listener cannot parse answers
+  400 and applies nothing. A TUN that fails to start, for lack of
+  permission to create the device or in a build without TUN, is turned off
+  again as on a reload, and the PATCH answers 500 with the reason.
+  `GET /configs` now reports `tun` as well, with `enable` saying whether
+  the listener runs. Like a patched `mode`, the change is kept in memory
+  until the config is saved.
+
+- **`provider-name` on every proxy in the API**: `GET /proxies`, the group
+  routes and `GET /providers/proxies` now report, on each proxy, the
+  proxy-provider that supplied it, or `""` for `proxies:` entries, groups
+  and the built-ins, matching mihomo. GUIs such as Clash Party read it to
+  send a provider node's delay test to the provider route; without it they
+  probed `/proxies/{name}/delay`, got a 404 and showed every provider node
+  as timed out. `GET /proxies/{name}` and `GET /proxies/{name}/delay` also
+  resolve a provider node now (a meow extension; mihomo returns 404), so
+  clients that probe each member of a `use:` group there, like meow-android
+  and meow-ios, get a real delay. A `proxies:` entry wins over a provider
+  node of the same name, and between providers the first by name wins.
+
+- **Proxy-group `hidden:` and `icon:`**: both keys are parsed and reported
+  on every group in `GET /proxies` (`false` / `""` when unset), matching
+  mihomo, so GUIs can leave hidden groups out of their list and show a
+  group's icon. Routing ignores both.
+
+- **Proxy providers report their plan usage** (`subscriptionInfo`):
+  `GET /providers/proxies` and `GET /providers/proxies/{name}` include the
+  traffic and expiry an `http` provider's server sends in its
+  `subscription-userinfo` response header, as
+  `"subscriptionInfo": {"Upload", "Download", "Total", "Expire"}`, the way
+  mihomo does, so dashboards such as Clash Party, zashboard and metacubexd
+  show how much of a plan is used and when it ends. The last fetch the
+  provider accepted decides: one without the header drops the field, a
+  failed one keeps it. The usage is kept next to the provider cache
+  (`<path>.subscription-userinfo`), so a restart that starts from the cache
+  reports it before the first refetch. `file` providers have none.
+
+### Changed
+
+- **Rule providers report their format under mihomo's names**:
+  `GET /providers/rules` and `GET /providers/rules/{name}` echoed the
+  `format:` string as written in the config (`yaml`, `TEXT`, or `yaml`
+  when absent), while mihomo panels switch on `YamlRule`, `TextRule` and
+  `MrsRule`. `format` is now one of those three, and it is the format the
+  payload actually parsed as: an undeclared set is `YamlRule`, and an MRS
+  payload found by its magic bytes is `MrsRule` whatever was declared.
+  `format:` in the config stays case-insensitive. A client that matched
+  the old lower-case strings needs to accept the new names.
+
+### Fixed
+
+- **Connection metadata always carries `dscp`**: `GET /connections` left
+  `metadata.dscp` out when the inbound saw no DSCP, and mihomo dashboards
+  read it unconditionally. It is now always a number, `0` when there was
+  none, as in mihomo. A flow without a DSCP still never matches `DSCP,0`,
+  and the connection table now keeps a DSCP an inbound did record.
+- **Group delay tests keep the members that answered**:
+  `GET /group/{name}/delay` returned 504 as soon as one member timed out,
+  so panels showed a whole group as timed out over one slow node, and a
+  member that failed for another reason came back as `0`. The answer now
+  maps each member whose probe passed within `timeout` to its delay and
+  leaves the rest out, as mihomo does; it is a 504 only when no member
+  passed, an empty group included.
+- **A GUI's own GeoIP and ASN databases are used**: mihomo GUIs such as
+  Clash Party copy the country database into the home directory as
+  `country.mmdb` and the ASN database as `ASN.mmdb`, while meow looked
+  only for `Country.mmdb` and `GeoLite2-ASN.mmdb`. It downloaded its own
+  copy of each at startup instead (the country database only on a
+  case-sensitive filesystem such as Linux's), and when that download failed
+  a config with a `GEOIP` or `IP-ASN` rule did not load. The country
+  database is now found under any capitalisation of `Country.mmdb`, and
+  `ASN.mmdb` stands in for a missing `GeoLite2-ASN.mmdb`; a database meow
+  downloads keeps meow's names.
+
+### Security
+
+- **emSign ECC Root CA - G3 is no longer trusted**: the private keys of
+  eight eMudhra intermediates (EM DV/OV/EV TLS CA - G3B and G3C, and their
+  code-signing siblings) can be recovered from the certificates themselves,
+  so anyone could issue a certificate for any name under them
+  ([eMudhra incident](https://emudhra.we-have-a-problem.com/), Mozilla bug
+  2083449). meow trusted them through emSign ECC Root CA - G3, which
+  cross-signs emSign Root TLS CA - G3. Every certificate check uses the
+  Mozilla roots built into the binary, never the operating system's store,
+  and checks neither Certificate Transparency nor revocation, so the browser
+  and OS fixes did not reach it. An attacker on the path could impersonate
+  a TLS proxy server (Trojan, VLESS, VMess, AnyTLS, Hysteria2, TrustTunnel,
+  HTTP or SOCKS5 over TLS, the v2ray and gost plugins), a subscription,
+  rule-provider or geodata URL, or a DoH/DoT upstream. Connections that use
+  REALITY, pin a certificate `fingerprint`, or don't use TLS were not
+  affected. meow now requires `webpki-root-certs` 1.0.10, which drops that
+  root. The other root the compromised intermediates chain to, Sectigo's
+  AAA Certificate Services, was never in meow's store. `rustls-webpki`
+  moves to 0.103.16 for RUSTSEC-2026-0382, the same incident; only the
+  test TLS servers link it, so no release shipped it.
+
+## [0.25.0] - 2026-10-20
+
+### Added
+
+- **Logbook** (`GET /logbook`, `DELETE /logbook`, a meow extension): a
+  persistent record of the engine events worth reading later, the way
+  Surge's Logbook sits next to its log. It keeps starts and stops, runs that
+  ended without a clean stop (a crash, a kill, a power cut), config reloads
+  and API edits, subscription, proxy-provider, rule-provider and geodata
+  updates and their failures, listeners that did not start, outbound
+  interface changes, and `dialer-proxy` chains changing the member that
+  carries them, failing their health check through every member tried, or
+  taken down by their own dial failures between health checks.
+  Repeats of a failure fold into one entry with a count.
+  Entries are kept in an SQLite database, `<home>/logbook/logbook.db`, for
+  7 days and 2 MiB, and survive restarts and crashes; the API filters by
+  level, kind and subject, pages back with `before` and polls with
+  `since`, and an app's UI in another process can read the database
+  directly. The logbook never records the destinations of user traffic,
+  and records rule edits by index, not rule text. On by default;
+  `logbook: {enable: false}` turns it off. It bundles SQLite (about
+  1 MiB), so it is in the `full` build and the release binaries but not in
+  `minimal`, where `GET /logbook` reports `enabled: false`. Details, the
+  schema and the event kinds are in ADR-0014.
+
+- **`dialer-proxy` groups skip members that cannot reach the chained
+  server**: a member of a `url-test`, `fallback` or `load-balance` group can
+  pass the group's URL test and still be unable to reach the server of the
+  outbound chained through it, for example when an airport's audit rules
+  drop the port. A lazy front returns before the remote side connects, so
+  the chain failed as `Connected in 0 ms` followed by EOF or a broken pipe,
+  and the group kept picking the member. The group now skips the member for
+  that server once two chains in a row close before any reply, or once the
+  health check's chain probe fails through it. The probe runs after each
+  sweep, starting with the group's pick, and stops when 3 members pass, at
+  most 12 probes per server. Blocks back off from 5 minutes to 6 hours and
+  clear on any success, and the rest of the group's traffic keeps its
+  normal pick. There is no config change and
+  no mihomo equivalent. UDP chains and the relay-based fallback wrapper
+  (`anytls`, `hysteria2`, `ss` with an external plugin) are not covered.
+
+- **A chained outbound stays in its group when its front hop fails**: an
+  outbound with `dialer-proxy` first in a `fallback` group (an own server
+  chained through an airport's `url-test`) left the group whenever the
+  front hop failed, not the server: one failed health-check probe through
+  a bad front member took it out until the next sweep, and a front member
+  refusing a connection marked it dead at once. Now:
+  - A `url-test` group keeps an outbound's chains on the member that last
+    carried them, the outbound's carrier, while that member is alive and
+    not blocked for its server, instead of following the fastest member
+    to the test URL. They move only when the carrier fails, or its group
+    marks it down. A `fallback` group keeps its order: chains return to
+    an earlier member once it is no longer blocked.
+  - A chained outbound that fails its health check is checked through up
+    to 3 other members of its `dialer-proxy` group (the carrier first,
+    each over a fresh connection) before it is taken for down. The member
+    its own probe went through counts as tried, not dialled again. When
+    one reaches the server, the outbound stays up, the members that
+    failed are blocked for that server, and the one that reached it
+    carries the chains.
+  - A dial whose front hop fails to connect counts against the front
+    group's member, not against the chained outbound in the group dialling
+    it, while the front group has another live member left. So does a
+    chain that closes before any reply through a member that was not yet
+    the outbound's carrier: a burst of such chains strikes the member, not
+    the outbound. A carrier's failure still counts against the outbound,
+    since its server is then the likelier fault, and so does the failure
+    of the front group's last live member, at once rather than after that
+    member is given up on.
+  - At most 3 members take the blame for one server in a row. When a 4th
+    member fails it too, with none reaching it in between, the server is
+    the likelier fault: its failures count against the outbound and block
+    no member, until a member reaches it again. Without the bound, a
+    server that was down struck every member of the front group in turn,
+    and a front member that reports the refusal in its dial (hysteria2)
+    was marked dead, all before the outbound left its group. A member the
+    group dials with every usable one blocked for the server is its last
+    resort, and its failures count against the outbound too: blocks left
+    from an earlier outage, or a group of 3 members or fewer, no longer
+    leave too few members to fail the server in a row.
+  - The 5 s dial deadline is judged the same way: a front member whose
+    dial hangs times out inside its own group's dial, which counts it, and
+    a chained handshake left unanswered until the deadline (a member that
+    black-holes the server's port) fails like a chain closed before any
+    reply. Before, an expired dial always counted against the chained
+    outbound.
+  - A chain probe round in which no member reaches the server blocks none
+    of them: the server is the likelier fault, and its members would
+    otherwise all be blocked when it comes back. A round probes members
+    blocked for the server too, so a passing probe clears a block early;
+    one that fails again stays blocked without its backoff growing each
+    round.
+  - A chained outbound that is down comes back as soon as a chain probe
+    of its `dialer-proxy` group reaches its server through any member:
+    the probe ran the outbound's own protocol to the test URL, so its
+    delay is recorded and the groups holding the outbound take it back,
+    rather than at their own next health check.
+
+### Fixed
+
+- **Windows TUN works as soon as it reports ready**: Windows kept a new
+  Wintun address tentative while it checked the address for duplicates, and
+  a tentative address cannot send packets, so DNS and traffic right after
+  startup or a configuration reload could fail. meow now turns that check
+  off on its own adapter and creates the addresses ready to use. An adapter
+  reopened after an unclean shutdown has the stale addresses it still
+  carries replaced, IPv6 ones included even when no IPv6 address is
+  configured. An address another adapter still holds now fails the attempt
+  instead of leaving the device half-configured, and later retries move to
+  other IPv4 and IPv6 addresses.
+- **Another resolver's fake IP dials the sniffed name**: when a phone on a
+  LAN with a Surge (or Clash) gateway resolves a name while the VPN is down,
+  the app caches the gateway's fake IP from 198.18.0.0/15. Once the VPN is
+  back the flow reaches the tunnel with that literal and no name, matches
+  by IP and goes to a proxy, which cannot reach the range, so the
+  connection hangs until the app re-resolves. Such a destination, outside
+  the tunnel's own fake-IP range and with no snooped name, now dials the
+  name the sniffer saw, as a stale address in the own range already did,
+  and the connection notes say so. The literal is dropped whatever
+  `override-destination` says, including on the tproxy listener, so IP
+  rules and DIRECT use the name's real address; real addresses keep their
+  literal.
+- **`handle_tcp` sniffs flows it cannot name**: inbounds that hand the
+  tunnel a raw netstack stream (the TUN listener, the Android client's
+  tun2socks) had no sniffer, so an unmapped address in the own fake-IP
+  range was dropped and another resolver's fake IP black-holed. For those
+  flows only, `handle_tcp` now reads the client's first bytes for up to
+  200 ms, takes the TLS SNI or HTTP `Host` as the sniffed name, and relays
+  the bytes upstream first. Every other flow is relayed unread, and
+  callers need no change.
+
+## [0.24.0] - 2026-10-18
+
+### Added
+
+- **Traffic per proxy** (`GET /statistics`): the upload and download totals
+  plus the bytes each proxy carried since the tunnel started, TCP and UDP,
+  for a client's statistics screen. A group's traffic counts at the member
+  that carried it (the `chains[0]` of `/connections`); a proxy keeps its
+  totals after its connections close, and after a reload removes it. The
+  member of a `dialer-proxy` group also counts the front hop it carries for
+  the outbound chained through it, TCP and UDP, so the node in the middle
+  of a chain shows its traffic too, health probes and downloads through the
+  chain included; the upload and download totals still count each
+  connection once.
+- **Connection notes name the `dialer-proxy` hop**: the policy path stopped
+  at the outbound that owns the `dialer-proxy`, so a connection never showed
+  which member of the dialer group carried it. Each front-hop dial now adds
+  a note such as `Dialing ss.example.com:8443 via dialer-proxy fast → HK-01
+  (Vless)`, one per hop when chains nest. `chains` in `/connections` is
+  unchanged and still matches mihomo.
+
+### Fixed
+
+- **UDP traffic counts toward the totals**: only TCP relays added to the
+  upload and download totals, so `/traffic`, the `/connections` totals and
+  every client speed or usage figure built on them left out QUIC and every
+  other UDP flow. Each inbound now dials its UDP flows through one tunnel
+  helper that counts their payload, except for flows sent to REJECT or PASS,
+  which drop it.
+
+## [0.23.1] - 2026-10-17
+
+### Fixed
+
+- **meow-transport builds for iOS and tvOS again**: kcptun's `dscp:` option
+  called socket2's `set_tclass_v6` on every Unix target, but socket2 only
+  provides it on Android, Linux, macOS, the BSDs, Fuchsia and Cygwin. Since
+  kcptun joined meow-proxy's default features in 0.22.0, meow-transport has
+  failed to compile for `aarch64-apple-ios` / `aarch64-apple-tvos`. The call
+  is now limited to the targets socket2 supports; elsewhere the IPv6 traffic
+  class is skipped, as it already was on Windows, and the IPv4 DSCP is still
+  applied.
+
+### Security
+
+- **`zip` 9 for `external-ui-download`**: meow-config's opt-in dashboard
+  download moves from zip 2.4 to 9.0, which is patched for RUSTSEC-2026-0367,
+  -0368 and -0369. Those advisories are in zip's own `extract()`, which
+  meow-config never called: it writes each entry itself, skips names that
+  would leave the target directory, creates no symlinks and applies no stored
+  permissions. The feature is off in every release bundle.
+
+## [0.23.0] - 2026-10-16
+
+### Added
+
+- **Per-connection notes** (`connection-notes: true`, off by default): the
+  tunnel records a short, timestamped account of how it handled each TCP
+  connection — the inbound and owning app, the fake-IP reversal, every DNS
+  lookup a rule needed (upstream, answer or error, and how long it took), the
+  rule that matched, the dial result and how the relay ended. The new
+  `GET /connections/{id}` endpoint (a meow-rs extension) returns the
+  `/connections` entry plus its `notes`, and keeps answering for the last 256
+  closed connections that recorded notes, so short or failed flows can still
+  be explained. `/connections` itself is unchanged. Embedders can toggle the
+  recording with `Tunnel::set_connection_notes`.
+
+- **Inbound-supplied process identity for embedders**:
+  `meow_common::process_lookup::enable_inbound_process_info()` declares that
+  the embedder's inbound fills `Metadata::process` / `process_path` / `uid`
+  before dispatch. PROCESS-NAME, PROCESS-PATH and UID rules then stay live on
+  platforms without a native process lookup (Android) and match those fields
+  as supplied, so an Android VPN that resolves each flow's owner through
+  `ConnectivityManager.getConnectionOwnerUid` can route by package name or
+  app uid. Default behaviour is unchanged.
 
 - Opt-in TrustTunnel client outbound (`--features trusttunnel`):
   authenticated CONNECT, TCP half-close, bounded pooling and IPv4/IPv6 UDP
@@ -63,6 +474,35 @@ the canonical, in-repo source a release is cut from.
   (`shadow_tls_v3_e2e`, binary pinned by `scripts/fetch-shadowtls-server.sh`)
   now runs in CI; see `docs/plugins/shadow-tls.md` for configuration and
   limits (UDP only via `udp-over-tcp`; TLS 1.3 covers recommended).
+- **simple-obfs HTTP sends an empty `Host` for hosts Go would reject**:
+  subscriptions write `obfs-opts: {mode: http, host: /}` to get the empty
+  `Host:` header mihomo emits (Go's `Request.Write` blanks an invalid one),
+  but meow sent `Host: /:8443` verbatim. Behind a `dialer-proxy` whose
+  server sniffs HTTP and routes by `Host` (seen with airport VLESS nodes),
+  that sent the flow to a bogus target, so such a Snell or SS node worked in
+  mihomo and failed in meow. A host with a byte outside Go's valid set now
+  yields an empty `Host`, as in mihomo; ordinary hosts are unchanged.
+
+- **`/connections` reports the app that opened a flow**: `metadata.process`,
+  `processPath` and `uid` were blanked when a connection was registered, so
+  an inbound that supplies them (an Android VPN) never showed the owner.
+  They are now kept, as in mihomo.
+
+- **`/connections` shows the node a group actually uses**: a flow whose
+  rule targets a proxy group now records every group's selected member in
+  `chains`, leaf first like mihomo (`["HK-01", "Auto", "Proxy"]`), instead
+  of only the rule's group name, so dashboards and clients can tell which
+  node carries it. The chain is read when the flow is registered by peeking
+  each group's current pick (round-robin does not advance), and is skipped
+  entirely when connection details are not tracked (no external
+  controller).
+
+- **Bare IPv6 nameserver addresses** (#738): an unbracketed IPv6 literal in
+  any nameserver list is now taken as the whole address on the transport's
+  default port. The parser used to split on the last colon first, so
+  `2402:4e00::` failed with `InvalidPort("")` and `::1` / `tls://::1` were
+  read as host `:` on port 1. Bracketed `[addr]:port` keeps its explicit
+  port.
 
 - **LuCI notifications on OpenWrt 23.05 and 24.10.0**: configuration
   validation/saves, service actions, and client updates no longer report
@@ -116,6 +556,23 @@ the canonical, in-repo source a release is cut from.
 - **muxcool UDP compatibility**: reject outgoing datagrams larger than
   Xray's 8 KiB packet limit before transmission, preserving other streams
   on the shared mux session.
+
+- **`log-level:` in the config file now applies at startup** (issue #729).
+  The field was parsed into `Config` and echoed by `GET /configs`, but the
+  tracing filter was only ever built from `RUST_LOG` (defaulting to
+  `info`) — a configured `log-level: debug` produced INFO-only output
+  until a runtime `PATCH /configs` set it, and the PATCH was lost on every
+  restart. The configured level is now applied once the raw config is
+  loaded — before `build_config`, so parse/provider diagnostics already
+  respect it — and `PUT /configs` applies the level when the committed
+  document actually changes it, so `GET /configs` can no longer echo a
+  level the process isn't running (unchanged-value commits — e.g. rules
+  or subscription edits — leave a `RUST_LOG` override alone).
+  An explicitly set `RUST_LOG` still takes precedence at startup as the
+  operator override. Values are whitelisted to the accepted level names
+  (the same set `PATCH` enforces) — a typo warns and keeps the current
+  filter instead of reaching `EnvFilter`, where a bare word parses as a
+  `target=TRACE` directive and would silence all logging.
 
 ## [0.22.0] - 2026-10-03
 
@@ -629,23 +1086,6 @@ the canonical, in-repo source a release is cut from.
   wholesale-replace became contribution merge; see the #640 fix below.
 
 ### Fixed
-
-- **`log-level:` in the config file now applies at startup** (issue #729).
-  The field was parsed into `Config` and echoed by `GET /configs`, but the
-  tracing filter was only ever built from `RUST_LOG` (defaulting to
-  `info`) — a configured `log-level: debug` produced INFO-only output
-  until a runtime `PATCH /configs` set it, and the PATCH was lost on every
-  restart. The configured level is now applied once the raw config is
-  loaded — before `build_config`, so parse/provider diagnostics already
-  respect it — and `PUT /configs` applies the level when the committed
-  document actually changes it, so `GET /configs` can no longer echo a
-  level the process isn't running (unchanged-value commits — e.g. rules
-  or subscription edits — leave a `RUST_LOG` override alone).
-  An explicitly set `RUST_LOG` still takes precedence at startup as the
-  operator override. Values are whitelisted to the accepted level names
-  (the same set `PATCH` enforces) — a typo warns and keeps the current
-  filter instead of reaching `EnvFilter`, where a bare word parses as a
-  `target=TRACE` directive and would silence all logging.
 
 - **XTLS Vision: a padded-mode FIN is no longer misreported as a relay
   error.** Vision has no end-of-stream frame — a peer that is done simply

@@ -211,6 +211,15 @@ pub struct RawConfig {
     /// Explicit `type: direct` proxy blocks are NOT covered by this
     /// global; they accept their own per-proxy `connect-timeout` field.
     pub tcp_connect_timeout: Option<u64>,
+    /// `connection-notes: true` records a timestamped account of how each
+    /// TCP connection was handled (fake-IP reversal, DNS lookups, matched
+    /// rule, dial, close), served by `GET /connections/{id}`. A meow
+    /// extension; off by default.
+    pub connection_notes: Option<bool>,
+    /// `logbook:` — the persistent record of notable engine events served
+    /// by `GET /logbook` (see `meow_common::logbook`). A meow extension; on
+    /// by default.
+    pub logbook: Option<RawLogbook>,
     /// Static host mappings, preferred over upstream DNS lookups. Values may
     /// be a single IP, a list of IPs, or one domain-name alias.
     pub hosts: Option<HashMap<String, HostsValue>>,
@@ -406,8 +415,9 @@ pub struct RawDns {
     /// If true, `/etc/hosts` is read at startup and merged (lower priority than
     /// top-level `hosts` config entries). No-op + warn on Windows.
     pub use_system_hosts: Option<bool>,
-    /// Per-domain nameserver routing: each key is an exact domain or a `+.`
-    /// wildcard prefix; value is a single server URL or a list of URLs.
+    /// Per-domain nameserver routing: each key is an exact domain or a `+.` /
+    /// `*.` / `.` wildcard prefix; value is a single server URL or a list of
+    /// URLs.
     pub nameserver_policy: Option<HashMap<String, RawNspValue>>,
     /// Controls when the `fallback:` nameservers replace the primary result.
     pub fallback_filter: Option<RawFallbackFilter>,
@@ -473,6 +483,15 @@ pub struct RawProxyGroup {
     /// Upstream's providers-only alias — identical to `include-all` here
     /// (our `include-all` never pulls statics; `include-all-proxies` does).
     pub include_all_providers: Option<bool>,
+    /// mihomo `hidden:` — asks GUIs to leave the group out of their group
+    /// list. Reported on the group in `GET /proxies`; routing ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
+    /// mihomo `icon:` — an image URL, path or inline SVG a GUI shows for
+    /// the group. Reported on the group in `GET /proxies`; routing ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -562,6 +581,21 @@ pub struct RawRuleProvider {
     pub header: Option<HashMap<String, StringOrList>>,
     /// Inline payload: list of rule strings (only for type=inline).
     pub payload: Option<Vec<String>>,
+}
+
+/// `logbook:` section.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawLogbook {
+    /// Record events under `<home>/logbook/`. Default true.
+    pub enable: Option<bool>,
+}
+
+impl RawLogbook {
+    /// The effective `logbook.enable` of a config.
+    pub fn enabled(raw: Option<&Self>) -> bool {
+        raw.and_then(|logbook| logbook.enable).unwrap_or(true)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

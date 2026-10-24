@@ -206,6 +206,18 @@ pub trait ProxyAdapter: Send + Sync {
     fn health(&self) -> &ProxyHealth;
 }
 
+/// The `hidden:` and `icon:` keys of a proxy-group. Only GUIs read them —
+/// they come back on the group in `GET /proxies` — so routing never looks
+/// at either.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupDisplay {
+    /// `hidden: true` asks GUIs to leave the group out of their group list.
+    pub hidden: bool,
+    /// `icon:`, an image URL, path or inline SVG a GUI shows for the group.
+    /// Empty when the group sets none.
+    pub icon: Box<str>,
+}
+
 /// Shared live proxy list owned by a `ProxyProvider`.
 /// Groups hold `Vec<ProviderSlot>` and walk statics then slot contents under
 /// a read guard at pick time — the provider swaps the `Vec` on refresh and
@@ -279,10 +291,23 @@ pub trait Proxy: ProxyAdapter {
         None
     }
 
+    /// For group adapters: the group's `hidden:` / `icon:` config keys.
+    /// Leaf adapters return `None`.
+    fn group_display(&self) -> Option<&GroupDisplay> {
+        None
+    }
+
     /// Monotonic traffic-use generation for genuinely lazy health checks.
     /// Leaf adapters return zero; automatic groups increment on every dial.
     fn usage_generation(&self) -> u64 {
         0
+    }
+
+    /// For automatic groups: which members cannot carry a `dialer-proxy`
+    /// chain to which server. Leaf adapters and manual groups return
+    /// `None`. See [`crate::chain_health`].
+    fn chain_health(&self) -> Option<&Arc<crate::chain_health::ChainHealth>> {
+        None
     }
 }
 

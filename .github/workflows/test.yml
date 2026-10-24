@@ -95,6 +95,12 @@ jobs:
       - name: Clippy (no default features)
         run: cargo clippy --all-targets --no-default-features -- -D warnings
 
+      # `minimal` leaves out `logbook`, but every workspace run above turns it
+      # on (meow-api's dev-dependency enables it), so the stub that stands in
+      # for it (`meow-common/src/logbook/disabled.rs`) needs its own run.
+      - name: Clippy (meow-common without logbook)
+        run: cargo clippy -p meow-common --all-targets -- -D warnings
+
       - name: Doc check
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
@@ -272,7 +278,7 @@ jobs:
           # And for shadow_tls_v3_e2e's official-server interop suite.
           SHADOWTLS_SERVER_BIN: ${{ runner.temp }}/shadow-tls/shadow-tls
         run: |
-          cargo nextest run --lib --bin meow --bin meow-bench \
+          cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
             --test common_test \
             --test socks5_udp_user \
             --test dns_cache_test \
@@ -282,6 +288,7 @@ jobs:
             --test statistics_test \
             --test rules_test \
             --test api_test \
+            --test meow_cli_test \
             --test raii_guard_test \
             --test http_connection_close \
             --test config_persistence_test \
@@ -315,6 +322,12 @@ jobs:
       # unified invocation above feature unification compiles them out.
       - name: API tests without listener-tun (TUN reconcile)
         run: cargo nextest run -p meow-api --test api_test --retries 2 --no-fail-fast
+
+      # `minimal` leaves out `logbook`, which every run above unifies on;
+      # `-p meow-common` alone builds the stub that stands in for it
+      # (`meow-common/src/logbook/disabled.rs`).
+      - name: Logbook stub tests (meow-common without logbook)
+        run: cargo nextest run -p meow-common --lib logbook --retries 2 --no-fail-fast
 
       - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
         run: cargo nextest run -p meow-listener --all-features --lib udp_port_53 --retries 2 --no-fail-fast
@@ -494,11 +507,12 @@ jobs:
       - name: Unit + integration tests (windows)
         shell: bash
         run: |
-          cargo nextest run --lib --bin meow --bin meow-bench \
+          cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
             --test common_test \
             --test config_test \
             --test rules_test \
             --test api_test \
+            --test meow_cli_test \
             --test trojan_integration \
             --test tls_test \
             --test boring_tls_test \
@@ -513,6 +527,35 @@ jobs:
       # platform-neutral TUN routing-loop guard.
       - name: meow-listener TUN tests (listener-tun)
         run: cargo nextest run -p meow-listener --features listener-tun --lib --retries 2 --no-fail-fast
+
+      # Creates real Wintun adapters, which needs Administrator (the
+      # hosted runner has it), so the tests are `#[ignore]`d for local
+      # runs: the addresses must come up Preferred, not tentative, and
+      # replace the ones a reopened adapter still carries. Each test runs
+      # in its own step invoking nextest with an exact-name filter — a
+      # rename fails that step with "no tests run" (--no-tests=fail)
+      # instead of a module-path substring silently matching nothing — or
+      # an OR'd filter still running the survivors and staying green.
+      # Three steps rather than one `run:` block: the pwsh wrapper only
+      # propagates the LAST command's exit code, so a failing non-last
+      # leg in a shared block would stay green.
+      - name: Wintun address setup (privileged) — preferred addresses
+        run: >-
+          cargo nextest run -p meow-listener --features listener-tun --lib
+          --run-ignored only --no-capture --retries 2 --no-tests=fail
+          -E "test(=tun::windows_device::tests::addresses_are_preferred_and_replace_stale_ones)"
+
+      - name: Wintun address setup (privileged) — inet6 none replaces both families
+        run: >-
+          cargo nextest run -p meow-listener --features listener-tun --lib
+          --run-ignored only --no-capture --retries 2 --no-tests=fail
+          -E "test(=tun::windows_device::tests::inet6_none_replaces_stale_addresses_of_both_families)"
+
+      - name: Wintun address setup (privileged) — conflicted address left as found
+        run: >-
+          cargo nextest run -p meow-listener --features listener-tun --lib
+          --run-ignored only --no-capture --retries 2 --no-tests=fail
+          -E "test(=tun::windows_device::tests::conflicted_address_fails_and_leaves_the_adapter_as_found)"
 
   macos:
     runs-on: macos-latest
@@ -535,11 +578,12 @@ jobs:
 
       - name: Core smoke tests
         run: |
-          cargo nextest run --lib --bin meow --bin meow-bench \
+          cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
             --test common_test \
             --test config_test \
             --test rules_test \
             --test api_test \
+            --test meow_cli_test \
             --test trojan_integration \
             --test tls_test \
             --test boring_tls_test \
